@@ -21,19 +21,12 @@ import (
 // notices. --timeout 0 asks for the other behaviour explicitly.
 const defaultTimeout = 30 * time.Second
 
-// stopGrace is how long a finished command waits for a delivery still in
-// flight before it tears the catcher down. See smtp.Server.Stop for why it
-// waits at all; half a second is far more than a loopback acknowledgement
-// needs, and short enough not to be felt by a script whose sender holds its
-// connection open.
-const stopGrace = 500 * time.Millisecond
-
 // options is what every script-mode command needs to know: which message, how
-// long to wait for it, and where to listen.
+// long to wait for it, and what sort of catcher to run.
 type options struct {
 	selection match.Criteria
 	timeout   time.Duration
-	smtpAddr  string
+	smtp      smtp.Config
 }
 
 // bindSelection binds the flags that say which message the command is about.
@@ -55,14 +48,19 @@ func bindContent(fs *flag.FlagSet, c *match.Criteria) {
 	fs.StringVar(&c.Contains, "contains", "", "substring of the subject or of either body")
 }
 
-// bindCommon binds the flags every script-mode command shares.
+// bindCommon binds the flags every script-mode command shares: the wait, and
+// the catcher itself. The listener flags come from bindSMTP, the same function
+// interactive mode uses, so the two modes cannot end up with different
+// defaults for the same flag.
 func bindCommon(fs *flag.FlagSet, o *options) {
 	fs.DurationVar(&o.timeout, "timeout", defaultTimeout, "how long to wait; 0 waits until interrupted")
-	fs.StringVar(&o.smtpAddr, "smtp-addr", DefaultSMTPAddr, "loopback address to catch mail on")
+
+	o.smtp = smtp.DefaultConfig()
+	bindSMTP(fs, &o.smtp)
 }
 
-// catch runs a catcher on o.smtpAddr and returns the first message matching
-// o.selection.
+// catch runs a catcher configured by o.smtp and returns the first message
+// matching o.selection.
 //
 // The second result is the exit code, ExitOK when a message was found. A
 // non-zero code has already been explained on stderr: there is one way each of
@@ -70,7 +68,7 @@ func bindCommon(fs *flag.FlagSet, o *options) {
 // error type through three commands to reach the same three sentences would be
 // ceremony.
 func (a *App) catch(ctx context.Context, o options) (message.Message, int) {
-	if err := checkLoopback(o.smtpAddr); err != nil {
+	if err := validateSMTP(o.smtp); err != nil {
 		a.errf("%v", err)
 		return message.Message{}, ExitUsage
 	}
@@ -80,10 +78,10 @@ func (a *App) catch(ctx context.Context, o options) (message.Message, int) {
 	// A nil log writer. The catcher's running commentary would land on stderr
 	// next to the diagnostics, and a script that captures stdout does not want
 	// to read about every connection on the way past.
-	server, err := smtp.Listen(o.smtpAddr, messages, nil)
+	server, err := smtp.Listen(o.smtp, messages, nil)
 	if err != nil {
 		a.errf("%v", err)
-		a.errf("another mailtui may already be listening there; stop it, or pass --smtp-addr with a free loopback port")
+		a.listenHint(err)
 		return message.Message{}, ExitUsage
 	}
 
@@ -99,7 +97,7 @@ func (a *App) catch(ctx context.Context, o options) (message.Message, int) {
 		// ends the goroutines behind those sessions; the receive then waits
 		// for Serve to return. Nothing of ours is still running past this
 		// point.
-		server.Stop(stopGrace)
+		server.Stop(smtp.StopGrace)
 		<-serverErr
 	}()
 
@@ -126,13 +124,14 @@ func (a *App) catch(ctx context.Context, o options) (message.Message, int) {
 		// Put it back for the deferred receive, which would otherwise block.
 		serverErr <- serr
 		if serr != nil {
-			a.errf("smtp: %v", serr)
+			a.errf("the catcher stopped: %v", serr)
 			return message.Message{}, ExitUsage
 		}
 	default:
 	}
 
 	if ctx.Err() != nil {
+		// SIGINT or SIGTERM; see the package comment on signal ownership.
 		a.errf("interrupted while waiting for %s", describe(o.selection))
 		return message.Message{}, ExitInterrupted
 	}
