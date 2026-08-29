@@ -30,6 +30,12 @@ func scribble(msg *message.Message) {
 	for i := range msg.HeaderTo {
 		msg.HeaderTo[i] = "mutated-header@example.test"
 	}
+	for i := range msg.Headers {
+		msg.Headers[i] = message.Header{Key: "X-Mutated", Value: "mutated"}
+	}
+	for i := range msg.Attachments {
+		msg.Attachments[i] = message.Attachment{Filename: "mutated.bin"}
+	}
 }
 
 // checkIntact asserts that a snapshot still says what was captured, with no
@@ -58,6 +64,40 @@ func checkIntact(t *testing.T, context string, msg message.Message, wantID, want
 	if !strings.Contains(string(msg.Raw), "Subject: "+wantSubject) {
 		t.Errorf("%s: Raw no longer contains the captured message: %q", context, msg.Raw)
 	}
+
+	// The two slice fields inspection added are as much the Store's own as
+	// Raw is, and are the ones a new consumer is most likely to edit in place.
+	if len(msg.Headers) == 0 {
+		t.Errorf("%s: Headers is empty; the fixture no longer proves anything", context)
+	}
+	for _, h := range msg.Headers {
+		if h.Key == "X-Mutated" {
+			t.Errorf("%s: Headers was overwritten: %+v", context, msg.Headers)
+			break
+		}
+	}
+	if want := "Trace-Id: " + wantSubject; !strings.Contains(headerLine(msg), want) {
+		t.Errorf("%s: Headers no longer contains %q: %+v", context, want, msg.Headers)
+	}
+
+	if len(msg.Attachments) != 1 {
+		t.Errorf("%s: Attachments = %+v, want the one the fixture sends", context, msg.Attachments)
+	} else if want := "data.csv"; msg.Attachments[0].Filename != want {
+		t.Errorf("%s: Attachments[0].Filename = %q, want %q", context, msg.Attachments[0].Filename, want)
+	}
+}
+
+// headerLine flattens the header block so a test can ask whether one field
+// survived without caring where in the block it sits.
+func headerLine(msg message.Message) string {
+	var b strings.Builder
+	for _, h := range msg.Headers {
+		b.WriteString(h.Key)
+		b.WriteString(": ")
+		b.WriteString(h.Value)
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 // TestAddCopiesItsArgument covers the producer side. The SMTP session builds a
