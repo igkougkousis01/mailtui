@@ -62,7 +62,7 @@ func only(t *testing.T, st *store.Store) message.Message {
 	return list[0]
 }
 
-// TestDataAddsMessageToStore pins the milestone's central change: the outcome
+// TestDataAddsMessageToStore pins the catcher's central contract: the outcome
 // of DATA is a stored message, not a line of output.
 func TestDataAddsMessageToStore(t *testing.T) {
 	s, st, _ := newSession(t)
@@ -195,9 +195,9 @@ func TestDataStoresUnparsableMessage(t *testing.T) {
 	}
 }
 
-// TestDataNotifiesSubscribers is the end of the flow this milestone builds:
-// DATA reaches a consumer without anyone polling for it. The consumer is
-// handed an ID and fetches the message itself.
+// TestDataNotifiesSubscribers covers the end of the capture flow: DATA reaches
+// a consumer without anyone polling for it. The consumer is handed an ID and
+// fetches the message itself.
 func TestDataNotifiesSubscribers(t *testing.T) {
 	s, st, _ := newSession(t)
 

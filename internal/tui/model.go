@@ -249,9 +249,9 @@ func (m *Model) refresh() {
 		}
 	}
 
-	// The message being read is gone. Nothing removes messages in this
-	// milestone, but the store can, and a cursor past the end would panic the
-	// preview rather than merely look wrong.
+	// The message being read is gone. The current UI does not remove messages,
+	// but the store can, and a cursor past the end would panic the preview
+	// rather than merely look wrong.
 	m.clampCursor()
 }
 
@@ -294,11 +294,11 @@ func (m Model) maxScroll() int {
 // key does not match, so a Model whose fields were set directly is never drawn
 // stale — the cache is an optimisation, not a correctness requirement.
 //
-// It is also the one place scroll is reset. Both resets the milestone calls for
-// — a different message, a different mode — are exactly "the key changed in a
-// way that makes the old offset meaningless", and doing it here means no
-// handler has to remember. A resize is deliberately not a reset: the reader has
-// not moved, so neither should their position.
+// It is also the one place scroll is reset. A different message and a different
+// mode both mean "the key changed in a way that makes the old offset
+// meaningless", and doing it here means no handler has to remember. A resize
+// is deliberately not a reset: the reader has not moved, so neither should
+// their position.
 func (m *Model) syncContent() {
 	key := m.currentContentKey()
 

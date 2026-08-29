@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Build release binaries
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+          ldflags="-s -w -X github.com/igkougkousis01/mailtui/internal/version.Version=${version}"
+          mkdir -p dist
+
+          targets=(
+            "darwin arm64 mailtui_Darwin_arm64"
+            "darwin amd64 mailtui_Darwin_amd64"
+            "linux amd64 mailtui_Linux_amd64"
+            "linux arm64 mailtui_Linux_arm64"
+            "windows amd64 mailtui_Windows_amd64.exe"
+          )
+
+          for target in "${targets[@]}"; do
+            read -r goos goarch output <<< "$target"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -trimpath -ldflags "$ldflags" -o "dist/$output" ./cmd/mailtui
+          done
+
+          (
+            cd dist
+            sha256sum mailtui_* > checksums.txt
+          )
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --verify-tag \
+              --generate-notes \
+              --title "mailtui $TAG"
+          fi
+
+          gh release upload "$TAG" dist/* --clobber

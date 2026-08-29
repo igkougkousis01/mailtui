@@ -243,7 +243,7 @@ func TestArrivalPicksUpEveryMessage(t *testing.T) {
 	}
 }
 
-// Nothing in this milestone deletes a message, but the store can, and a stale
+// The current UI does not delete messages, but the store can, and a stale
 // cursor would index past the end of the snapshot.
 func TestSelectionSurvivesTheMessageDisappearing(t *testing.T) {
 	m, st := newModel(t, "first", "second", "third")

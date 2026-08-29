@@ -119,8 +119,8 @@ func TestCaptureMultipartMixed(t *testing.T) {
 	if want := "<p>Your report is attached.</p>"; !strings.Contains(msg.HTMLBody, want) {
 		t.Errorf("HTMLBody = %q, want it to contain %q", msg.HTMLBody, want)
 	}
-	// Attachments are out of scope for this milestone, so the CSV payload must
-	// not end up mixed into a body.
+	// Attachment payloads are metadata-only, so the CSV bytes must not end up
+	// mixed into a body.
 	if strings.Contains(msg.TextBody, "month,total") || strings.Contains(msg.HTMLBody, "month,total") {
 		t.Errorf("attachment content leaked into a body:\ntext: %q\nhtml: %q", msg.TextBody, msg.HTMLBody)
 	}

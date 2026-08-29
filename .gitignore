@@ -1,1 +1,16 @@
 .DS_Store
+
+# Go build and test output
+/mailtui
+/mailtui.exe
+*.test
+*.out
+coverage.*
+*.coverprofile
+
+# Editor temporary files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

@@ -326,7 +326,7 @@ func TestSenderIsAcknowledgedBeforeShutdown(t *testing.T) {
 }
 
 // TestScriptStdoutStaysMachineOnly restates the guarantee that makes
-// OTP=$(mailtui extract otp ...) safe, over the paths this milestone added to:
+// OTP=$(mailtui extract otp ...) safe across every script-mode outcome:
 // a version or a startup line leaking here would be caught as a changed value.
 func TestScriptStdoutStaysMachineOnly(t *testing.T) {
 	got := runCatching(t, context.Background(),
