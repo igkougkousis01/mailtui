@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/igkougkousis01/mailtui/internal/smtp"
 )
 
 // Mail the tests send. The envelope and the headers differ so that a value in
@@ -63,7 +65,7 @@ func newApp() (*App, *bytes.Buffer, *bytes.Buffer, *bool) {
 	app := &App{
 		Stdout: &stdout,
 		Stderr: &stderr,
-		Interactive: func(ctx context.Context) error {
+		Interactive: func(ctx context.Context, cfg smtp.Config) error {
 			launched = true
 			return nil
 		},
@@ -202,16 +204,16 @@ func TestInteractiveFailureIsReportedAndFails(t *testing.T) {
 	app := &App{
 		Stdout: &stdout,
 		Stderr: &stderr,
-		Interactive: func(context.Context) error {
-			return errors.New("listen on 127.0.0.1:1025: address already in use")
+		Interactive: func(context.Context, smtp.Config) error {
+			return errors.New("the inbox stopped")
 		},
 	}
 
 	if code := app.Run(context.Background(), nil); code != ExitFailure {
 		t.Fatalf("exit code = %d, want %d", code, ExitFailure)
 	}
-	if !strings.Contains(stderr.String(), "address already in use") {
-		t.Fatalf("stderr = %q, want the reason the inbox could not start", stderr.String())
+	if !strings.Contains(stderr.String(), "the inbox stopped") {
+		t.Fatalf("stderr = %q, want the reason the inbox stopped", stderr.String())
 	}
 }
 

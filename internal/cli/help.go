@@ -1,21 +1,65 @@
 package cli
 
+import (
+	"fmt"
+	"net"
+
+	"github.com/igkougkousis01/mailtui/internal/smtp"
+)
+
 // The help text is written by hand rather than generated from the flag
 // definitions, because the flags are the least of what someone needs to know:
 // how matching compares strings, what goes to stdout, and what an exit code
 // means are the parts that decide whether a test script is correct.
+//
+// Every default it quotes is interpolated from the constant the code actually
+// uses, so help that has gone stale is a compile-time impossibility rather
+// than something to notice in review.
 
-const rootHelp = `mailtui — a local SMTP catcher for development.
+// The defaults as help writes them. defaultPort is pulled out of the address
+// on its own because the shell example waits on the port with nc.
+var (
+	defaultSize = formatSize(smtp.DefaultMaxMessageBytes)
+	defaultPort = portOf(smtp.DefaultAddr)
+)
+
+// portOf is the port half of a host:port address, or the whole of it if it
+// somehow has no port to take.
+func portOf(addr string) string {
+	if _, port, err := net.SplitHostPort(addr); err == nil {
+		return port
+	}
+	return addr
+}
+
+var rootHelp = fmt.Sprintf(`mailtui — a local SMTP catcher for development.
 
 Usage:
-  mailtui                        catch mail and show it in the terminal inbox
+  mailtui [flags]                catch mail and show it in the terminal inbox
   mailtui wait [flags]           wait for a matching message to arrive
   mailtui assert [flags]         wait for a message and check what it says
   mailtui extract otp [flags]    print the one-time code from a message
   mailtui extract link [flags]   print a link from a message
+  mailtui version                print the version
+  mailtui help                   print this
 
-Run with no arguments, mailtui listens on ` + DefaultSMTPAddr + ` and shows what
-it catches in an interactive inbox. The other commands are for scripts.
+Examples:
+  mailtui
+  mailtui --smtp-addr 127.0.0.1:2525
+  mailtui wait --to user@example.test --subject "Reset"
+  OTP=$(mailtui extract otp --to user@example.test --timeout 5s)
+
+Run with no arguments, mailtui listens on %[1]s and shows what it
+catches in an interactive inbox; q or Ctrl-C leaves it. The other commands are
+for scripts.
+
+Catcher flags (every mode takes these):
+  --smtp-addr host:port    where to catch mail (default %[1]s)
+                           must be a loopback address
+  --max-message-bytes size largest message to accept (default %[2]s)
+                           bytes, or with a unit: 512KB, 10MB, 1GB
+                           units are powers of 1024
+  --max-recipients n       most recipients in one message (default %[3]d)
 
 Process model:
   Captured mail lives in memory in the process that caught it; nothing is
@@ -31,7 +75,7 @@ Process model:
 
     mailtui wait --to user@example.test --subject Reset --timeout 10s &
     waiter=$!
-    until nc -z 127.0.0.1 1025; do sleep 0.05; done   # the port is claimed
+    until nc -z 127.0.0.1 %[4]s; do sleep 0.05; done   # the port is claimed
     ./trigger-password-reset
     wait $waiter                                      # its exit code is yours
 
@@ -41,15 +85,16 @@ Matching:
   There is no regular expression syntax and no exact-match mode.
 
 Timeouts:
-  Waiting commands stop after --timeout, which defaults to 30s. --timeout 0
+  Waiting commands stop after --timeout, which defaults to %[5]s. --timeout 0
   waits until interrupted. Ctrl-C stops any of them.
 
 Exit codes:
-  0    success
-  1    nothing matched in time, an assertion failed, or nothing to extract
+  0    success, and quitting the inbox with q or Ctrl-C
+  1    nothing matched in time, an assertion failed, nothing to extract, or
+       the inbox stopped on an error of its own
   2    usage or configuration error: a bad flag, an address that is not
        loopback, a port already in use
-  130  interrupted with Ctrl-C
+  130  a waiting command was interrupted by SIGINT (Ctrl-C) or SIGTERM
 
 Output:
   stdout carries the result and nothing else — no banners, no logs — so it can
@@ -57,7 +102,7 @@ Output:
   the catcher has claimed the port, goes to stderr.
 
 Run "mailtui <command> --help" for a command's flags.
-`
+`, smtp.DefaultAddr, defaultSize, smtp.DefaultMaxRecipients, defaultPort, defaultTimeout)
 
 // selectionHelp is the flag list shared by every script-mode command. The
 // address flags come in three forms because mailtui keeps the SMTP envelope
@@ -77,16 +122,20 @@ const selectionHelp = `Selecting a message:
 `
 
 // commonHelp closes every command's flag list: the flags that are not about
-// which message, and the one rule that governs all of them.
-const commonHelp = `Common flags:
-  --timeout duration       how long to wait (default 30s; 0 waits forever)
-  --smtp-addr host:port    where to catch mail (default ` + DefaultSMTPAddr + `)
+// which message, and the one rule that governs all of them. The catcher flags
+// are the same three interactive mode takes, with the same defaults.
+var commonHelp = fmt.Sprintf(`Common flags:
+  --timeout duration       how long to wait (default %s; 0 waits forever)
+  --smtp-addr host:port    where to catch mail (default %s)
                            must be a loopback address
+  --max-message-bytes size largest message to accept (default %s)
+                           bytes, or with a unit: 512KB, 10MB, 1GB
+  --max-recipients n       most recipients in one message (default %d)
 
 All text matching is case-insensitive substring matching.
-`
+`, defaultTimeout, smtp.DefaultAddr, defaultSize, smtp.DefaultMaxRecipients)
 
-const waitHelp = `mailtui wait — block until a matching message arrives.
+var waitHelp = `mailtui wait — block until a matching message arrives.
 
 Usage:
   mailtui wait --to john@example.test --subject "Reset password" --timeout 5s
@@ -113,7 +162,7 @@ Exit codes:
   130  interrupted
 `
 
-const assertHelp = `mailtui assert — wait for a message that says what it should.
+var assertHelp = `mailtui assert — wait for a message that says what it should.
 
 Usage:
   mailtui assert --to john@example.test \
@@ -162,10 +211,14 @@ Usage:
   mailtui extract otp [flags]
   mailtui extract link [flags]
 
+Examples:
+  OTP=$(mailtui extract otp --to john@example.test --timeout 5s)
+  URL=$(mailtui extract link --to john@example.test --timeout 5s)
+
 Run "mailtui extract otp --help" or "mailtui extract link --help" for details.
 `
 
-const otpHelp = `mailtui extract otp — print the one-time code from a message.
+var otpHelp = `mailtui extract otp — print the one-time code from a message.
 
 Usage:
   OTP=$(mailtui extract otp --to john@example.test --timeout 5s)
@@ -207,7 +260,7 @@ Exit codes:
   130  interrupted
 `
 
-const linkHelp = `mailtui extract link — print a link from a message.
+var linkHelp = `mailtui extract link — print a link from a message.
 
 Usage:
   URL=$(mailtui extract link --to john@example.test --timeout 5s)

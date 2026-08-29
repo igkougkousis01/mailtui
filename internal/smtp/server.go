@@ -24,28 +24,6 @@ import (
 	"github.com/igkougkousis01/mailtui/internal/store"
 )
 
-const (
-	// maxMessageBytes caps a single message so a runaway sender cannot
-	// exhaust memory. 25 MB matches what most real providers accept.
-	maxMessageBytes = 25 * 1024 * 1024
-
-	maxRecipients = 100
-	readTimeout   = 60 * time.Second
-	writeTimeout  = 30 * time.Second
-)
-
-// ListenAndServe starts the SMTP catcher on addr and blocks until it stops.
-// Captured messages are added to st, which the caller owns and shares with the
-// rest of the program. A one-line note about each message is written to log,
-// which may be nil to keep quiet.
-func ListenAndServe(addr string, st *store.Store, log io.Writer) error {
-	s, err := Listen(addr, st, log)
-	if err != nil {
-		return err
-	}
-	return s.Serve()
-}
-
 // Server is a catcher that has claimed its port but is not yet accepting.
 //
 // It exists for callers that need the port before the mail starts flowing: a
@@ -60,19 +38,22 @@ type Server struct {
 	log     io.Writer
 }
 
-// Listen claims addr for a catcher that adds what it receives to st.
+// Listen claims cfg.Addr for a catcher that adds what it receives to st.
 //
 // The port is held from here on, so a caller that gets a Server back and then
 // changes its mind must Close it. Notes about each message go to log, which
-// may be nil to keep quiet; see ListenAndServe.
-func Listen(addr string, st *store.Store, log io.Writer) (*Server, error) {
+// may be nil to keep quiet.
+//
+// A failure to bind comes back as a *ListenError, so a caller can say which
+// address it was and whether the port was already taken.
+func Listen(cfg Config, st *store.Store, log io.Writer) (*Server, error) {
 	b := &backend{store: st, log: log}
 	s := gosmtp.NewServer(b)
 
-	s.Addr = addr
+	s.Addr = cfg.Addr
 	s.Domain = "localhost"
-	s.MaxMessageBytes = maxMessageBytes
-	s.MaxRecipients = maxRecipients
+	s.MaxMessageBytes = cfg.MaxMessageBytes
+	s.MaxRecipients = cfg.MaxRecipients
 	s.ReadTimeout = readTimeout
 	s.WriteTimeout = writeTimeout
 
@@ -88,9 +69,9 @@ func Listen(addr string, st *store.Store, log io.Writer) (*Server, error) {
 
 	// Bind first so we only claim to be listening once the port is actually
 	// ours, and so the caller sees the real address when addr uses port 0.
-	l, err := net.Listen("tcp", addr)
+	l, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
-		return nil, fmt.Errorf("listen on %s: %w", addr, err)
+		return nil, &ListenError{Addr: cfg.Addr, Err: err}
 	}
 
 	return &Server{srv: s, backend: b, l: l, log: log}, nil
@@ -107,7 +88,7 @@ func (s *Server) Serve() error {
 }
 
 // Stop shuts the catcher down, giving deliveries already under way up to grace
-// to finish first.
+// to finish first. StopGrace is the wait callers normally give it.
 //
 // The grace is not politeness, it is correctness. A message reaches the store
 // while its SMTP session is still open: the server writes its 250 only after
@@ -124,9 +105,23 @@ func (s *Server) Stop(grace time.Duration) error {
 
 // Close stops the catcher: the port is released and any session still open is
 // cut off, which is what ends the goroutines behind them. Serve then returns
-// nil. Calling it twice is harmless.
+// nil. Calling it twice is harmless, and so is calling it before Serve.
 func (s *Server) Close() error {
-	if err := s.srv.Close(); err != nil && !errors.Is(err, gosmtp.ErrServerClosed) {
+	err := s.srv.Close()
+
+	// And the listener this package bound itself, which the line above may not
+	// have touched: the SMTP library only closes the listeners Serve has
+	// registered with it, so a Close that arrives before Serve reached that
+	// point would leave it about to block in Accept, with the port still held,
+	// for as long as the process lived. Closing it here covers that ordering.
+	//
+	// It comes second so that Serve reads the accept failure as the shutdown
+	// it is — the server is already marked closed by then — and returns nil.
+	// The error is dropped because the only one it can give is that the
+	// listener was already closed, which is the ordinary case.
+	s.l.Close()
+
+	if err != nil && !errors.Is(err, gosmtp.ErrServerClosed) {
 		return err
 	}
 	return nil

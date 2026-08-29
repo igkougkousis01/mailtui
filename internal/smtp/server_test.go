@@ -2,8 +2,12 @@ package smtp
 
 import (
 	"bytes"
+	"errors"
+	"net"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/igkougkousis01/mailtui/internal/message"
 	"github.com/igkougkousis01/mailtui/internal/store"
@@ -282,4 +286,144 @@ func TestBackendGivesEachSessionTheSameStore(t *testing.T) {
 	if got := len(st.List()); got != 2 {
 		t.Errorf("store holds %d messages after two sessions, want 2", got)
 	}
+}
+
+// TestStopBeforeServeStillEndsServe covers the ordering a short-lived run
+// actually hits: the caller is finished before the goroutine that serves has
+// got as far as accepting.
+//
+// The SMTP library only closes the listeners Serve has registered with it, so
+// a stop that lands first closes nothing there and Serve would block in Accept
+// with the port held for the life of the process. Server.Close closes the
+// listener it bound itself for exactly this reason.
+func TestStopBeforeServeStillEndsServe(t *testing.T) {
+	srv, err := Listen(testConfig(t), store.New(), nil)
+	if err != nil {
+		t.Fatalf("listening: %v", err)
+	}
+	addr := srv.Addr().String()
+
+	// Stopped before anything starts serving, which is the case under test.
+	if err := srv.Stop(10 * time.Millisecond); err != nil {
+		t.Fatalf("stopping: %v", err)
+	}
+
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve() }()
+
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Errorf("Serve returned %v, want nil after a stop", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve never returned; the listener was left accepting")
+	}
+
+	// And the port really is free, not merely unattended.
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("the port was still held after stopping: %v", err)
+	}
+	l.Close()
+}
+
+// TestCloseIsIdempotent: every path out of a run stops the catcher, and some
+// of them overlap. None of that may panic or report a failure.
+func TestCloseIsIdempotent(t *testing.T) {
+	srv, err := Listen(testConfig(t), store.New(), nil)
+	if err != nil {
+		t.Fatalf("listening: %v", err)
+	}
+
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve() }()
+
+	for i := 0; i < 3; i++ {
+		if err := srv.Close(); err != nil {
+			t.Errorf("Close call %d returned %v, want nil", i+1, err)
+		}
+	}
+	if err := srv.Stop(10 * time.Millisecond); err != nil {
+		t.Errorf("Stop after Close returned %v, want nil", err)
+	}
+
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Errorf("Serve returned %v, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve never returned")
+	}
+}
+
+// TestListenReportsAPortAlreadyTaken: the failure a developer meets most
+// often, in the words they can act on rather than the network stack's three
+// nested repetitions of the same address.
+func TestListenReportsAPortAlreadyTaken(t *testing.T) {
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("holding a port: %v", err)
+	}
+	defer held.Close()
+
+	cfg := DefaultConfig()
+	cfg.Addr = held.Addr().String()
+
+	srv, err := Listen(cfg, store.New(), nil)
+	if err == nil {
+		srv.Close()
+		t.Fatal("Listen took a port that was already held")
+	}
+
+	var listenErr *ListenError
+	if !errors.As(err, &listenErr) {
+		t.Fatalf("err = %v, want a *ListenError", err)
+	}
+	if want := "cannot listen on " + cfg.Addr + ": address already in use"; err.Error() != want {
+		t.Errorf("err = %q, want %q", err, want)
+	}
+	if !errors.Is(err, syscall.EADDRINUSE) {
+		t.Errorf("err = %v, want the cause to survive wrapping so a caller can offer a hint", err)
+	}
+}
+
+// TestConfigIsApplied: the caps a caller sets are the caps the SMTP
+// conversation runs with, so that --max-recipients means something.
+func TestConfigIsApplied(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxMessageBytes = 4096
+	cfg.MaxRecipients = 2
+
+	srv, err := Listen(cfg, store.New(), nil)
+	if err != nil {
+		t.Fatalf("listening: %v", err)
+	}
+	defer srv.Close()
+
+	if srv.srv.MaxMessageBytes != 4096 {
+		t.Errorf("MaxMessageBytes = %d, want 4096", srv.srv.MaxMessageBytes)
+	}
+	if srv.srv.MaxRecipients != 2 {
+		t.Errorf("MaxRecipients = %d, want 2", srv.srv.MaxRecipients)
+	}
+}
+
+// TestDefaultConfig pins the values every mode starts from.
+func TestDefaultConfig(t *testing.T) {
+	want := Config{Addr: "127.0.0.1:1025", MaxMessageBytes: 25 * 1024 * 1024, MaxRecipients: 100}
+	if got := DefaultConfig(); got != want {
+		t.Errorf("DefaultConfig() = %+v, want %+v", got, want)
+	}
+}
+
+// testConfig is the defaults on a port the kernel picks, so that tests never
+// contend for the real one.
+func testConfig(t *testing.T) Config {
+	t.Helper()
+
+	cfg := DefaultConfig()
+	cfg.Addr = "127.0.0.1:0"
+	return cfg
 }
