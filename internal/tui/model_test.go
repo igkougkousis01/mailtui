@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -363,5 +364,338 @@ func TestNilSubscriptionYieldsNoCommand(t *testing.T) {
 
 	if cmd := m.Init(); cmd != nil {
 		t.Errorf("Init returned a command with no subscription: %T", cmd())
+	}
+}
+
+// --- inspection modes ----------------------------------------------------
+
+// addRaw stores whatever bytes it is given, for the tests that care about the
+// exact shape of a message rather than about it merely existing.
+func addRaw(t *testing.T, st *store.Store, raw string) string {
+	t.Helper()
+
+	return st.Add(message.Capture(
+		message.Envelope{From: "envelope@example.test", To: []string{"rcpt@example.test"}},
+		[]byte(raw),
+		receivedAt,
+	))
+}
+
+// addLong stores a message whose body is long enough that no pane can show all
+// of it, which is what makes scrolling observable.
+func addLong(t *testing.T, st *store.Store, subject string, lines int) string {
+	t.Helper()
+
+	var b strings.Builder
+	b.WriteString("From: long@example.test\r\nTo: dev@example.test\r\nSubject: " + subject + "\r\n\r\n")
+	for i := range lines {
+		fmt.Fprintf(&b, "line %03d of %s\r\n", i, subject)
+	}
+	return addRaw(t, st, b.String())
+}
+
+// sizedModel returns a model at a usable terminal size, with the inspection
+// content already built, which is what every arriving frame would have.
+func sizedModel(t *testing.T, m Model, w, h int) Model {
+	t.Helper()
+
+	m, _ = send(t, m, tea.WindowSizeMsg{Width: w, Height: h})
+	return m
+}
+
+func TestModeKeysSwitchTheInspectionMode(t *testing.T) {
+	base, _ := newModel(t, "only")
+
+	if base.mode != modeBody {
+		t.Fatalf("initial mode = %v, want Body: the body is what a mail client shows first", base.mode)
+	}
+
+	tests := []struct {
+		key  rune
+		want inspectMode
+		name string
+	}{
+		{'h', modeHeaders, "Headers"},
+		{'r', modeRaw, "Raw"},
+		{'a', modeAttachments, "Attachments"},
+		{'b', modeBody, "Body"},
+	}
+
+	m := base
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, _ = send(t, m, key(tt.key))
+			if m.mode != tt.want {
+				t.Errorf("after %q, mode = %v, want %v", tt.key, m.mode, tt.want)
+			}
+			if got := m.mode.String(); got != tt.name {
+				t.Errorf("mode names itself %q, want %q", got, tt.name)
+			}
+		})
+	}
+}
+
+// The mode is a standing preference about how to read mail, not a property of
+// one message, so moving through the inbox must not undo it.
+func TestModeSurvivesSelectionAndArrival(t *testing.T) {
+	m, st := newModel(t, "first", "second")
+	m = sizedModel(t, m, 100, 30)
+
+	m, _ = send(t, m, key('r'))
+	m, _ = send(t, m, key('j'))
+	if m.mode != modeRaw {
+		t.Errorf("mode = %v after moving to another message, want Raw", m.mode)
+	}
+
+	add(t, st, "third")
+	m, _ = send(t, m, mailArrivedMsg{})
+	if m.mode != modeRaw {
+		t.Errorf("mode = %v after an arrival, want Raw", m.mode)
+	}
+}
+
+// --- focus and scrolling -------------------------------------------------
+
+func TestTabSwitchesFocus(t *testing.T) {
+	m, _ := newModel(t, "only")
+
+	if m.focus != focusInbox {
+		t.Fatalf("initial focus = %v, want the inbox", m.focus)
+	}
+
+	m, _ = send(t, m, special(tea.KeyTab))
+	if m.focus != focusInspect {
+		t.Errorf("focus = %v after tab, want the inspection pane", m.focus)
+	}
+
+	m, _ = send(t, m, special(tea.KeyTab))
+	if m.focus != focusInbox {
+		t.Errorf("focus = %v after a second tab, want the inbox again", m.focus)
+	}
+}
+
+// j and k mean "move" in whichever pane is listening. With the inbox focused
+// they must not scroll the message, and with the message focused they must not
+// walk the inbox out from under the reader.
+func TestFocusDecidesWhatMovementKeysMove(t *testing.T) {
+	m, st := newModel(t)
+	addLong(t, st, "long", 200)
+	add(t, st, "newer")
+	m, _ = send(t, m, mailArrivedMsg{})
+	m = sizedModel(t, m, 100, 30)
+
+	// Inbox focused: the cursor moves and the content stays where it is.
+	m, _ = send(t, m, key('j'))
+	if m.cursor != 1 {
+		t.Fatalf("cursor = %d after j with the inbox focused, want 1", m.cursor)
+	}
+	if m.scroll != 0 {
+		t.Errorf("scroll = %d, want 0: j moved the cursor, not the content", m.scroll)
+	}
+
+	// Message focused: the content moves and the cursor stays where it is.
+	m, _ = send(t, m, special(tea.KeyTab))
+	m, _ = send(t, m, key('j'))
+	m, _ = send(t, m, key('j'))
+	if m.cursor != 1 {
+		t.Errorf("cursor = %d after j with the message focused, want it left alone at 1", m.cursor)
+	}
+	if m.scroll != 2 {
+		t.Errorf("scroll = %d, want 2", m.scroll)
+	}
+
+	m, _ = send(t, m, key('k'))
+	if m.scroll != 1 {
+		t.Errorf("scroll = %d after k, want 1", m.scroll)
+	}
+}
+
+// Scrolling stops at both ends. Past the top there is nothing, and past the
+// bottom the pane would show blank rows below a message that has ended.
+func TestScrollingStopsAtBothEnds(t *testing.T) {
+	m, st := newModel(t)
+	addLong(t, st, "long", 200)
+	m, _ = send(t, m, mailArrivedMsg{})
+	m = sizedModel(t, m, 100, 30)
+	m, _ = send(t, m, special(tea.KeyTab))
+
+	for range 5 {
+		m, _ = send(t, m, key('k'))
+	}
+	if m.scroll != 0 {
+		t.Errorf("scroll = %d after k at the top, want 0", m.scroll)
+	}
+
+	limit := m.maxScroll()
+	if limit <= 0 {
+		t.Fatalf("maxScroll = %d, so the fixture does not overflow the pane", limit)
+	}
+	for range limit + 20 {
+		m, _ = send(t, m, key('j'))
+	}
+	if m.scroll != limit {
+		t.Errorf("scroll = %d after running j past the end, want %d", m.scroll, limit)
+	}
+
+	// The last row of the content is on screen and no row past it is.
+	_, rows := m.inspectSize()
+	if got := len(m.content.window(m.scroll, rows)); got != rows {
+		t.Errorf("the pane shows %d rows at the bottom, want %d full rows", got, rows)
+	}
+}
+
+// A message short enough to fit does not scroll at all: j would otherwise
+// slide the only screenful of text off the top.
+func TestShortMessageDoesNotScroll(t *testing.T) {
+	m, _ := newModel(t, "short")
+	m = sizedModel(t, m, 100, 40)
+	m, _ = send(t, m, special(tea.KeyTab))
+
+	if got := m.maxScroll(); got != 0 {
+		t.Fatalf("maxScroll = %d for a message that fits, want 0", got)
+	}
+
+	m, _ = send(t, m, key('j'))
+	if m.scroll != 0 {
+		t.Errorf("scroll = %d, want 0", m.scroll)
+	}
+}
+
+// Reading position belongs to the message being read, so moving to another one
+// starts at its top rather than partway down it.
+func TestSwitchingMessageResetsScroll(t *testing.T) {
+	m, st := newModel(t)
+	addLong(t, st, "older", 200)
+	addLong(t, st, "newer", 200)
+	m, _ = send(t, m, mailArrivedMsg{})
+	m = sizedModel(t, m, 100, 30)
+
+	m, _ = send(t, m, special(tea.KeyTab))
+	for range 10 {
+		m, _ = send(t, m, key('j'))
+	}
+	if m.scroll == 0 {
+		t.Fatal("precondition: scroll = 0, so nothing was scrolled")
+	}
+
+	m, _ = send(t, m, special(tea.KeyTab))
+	m, _ = send(t, m, key('j'))
+
+	if got := selectedSubject(t, m); got != "older" {
+		t.Fatalf("selected = %q, want %q", got, "older")
+	}
+	if m.scroll != 0 {
+		t.Errorf("scroll = %d on a newly selected message, want 0", m.scroll)
+	}
+}
+
+// Each mode is a different amount of text about the same message, so an offset
+// carried across from another one would land somewhere arbitrary.
+func TestSwitchingModeResetsScroll(t *testing.T) {
+	m, st := newModel(t)
+	addLong(t, st, "long", 200)
+	m, _ = send(t, m, mailArrivedMsg{})
+	m = sizedModel(t, m, 100, 30)
+
+	m, _ = send(t, m, special(tea.KeyTab))
+	for range 10 {
+		m, _ = send(t, m, key('j'))
+	}
+	if m.scroll == 0 {
+		t.Fatal("precondition: scroll = 0, so nothing was scrolled")
+	}
+
+	m, _ = send(t, m, key('r'))
+	if m.scroll != 0 {
+		t.Errorf("scroll = %d after switching to Raw, want 0", m.scroll)
+	}
+}
+
+// Resizing is not a change of position. Someone who has scrolled to the middle
+// of a raw message and widens their terminal is still reading the middle of it.
+func TestResizeKeepsScroll(t *testing.T) {
+	m, st := newModel(t)
+	addLong(t, st, "long", 500)
+	m, _ = send(t, m, mailArrivedMsg{})
+	m = sizedModel(t, m, 100, 30)
+
+	m, _ = send(t, m, special(tea.KeyTab))
+	for range 10 {
+		m, _ = send(t, m, key('j'))
+	}
+
+	m = sizedModel(t, m, 140, 40)
+	if m.scroll != 10 {
+		t.Errorf("scroll = %d after a resize, want it left at 10", m.scroll)
+	}
+}
+
+// Shrinking the terminal until the content fits has to pull the offset back,
+// or the pane would be scrolled past the end of what it holds.
+func TestScrollIsClampedWhenContentShrinks(t *testing.T) {
+	m, st := newModel(t)
+	addLong(t, st, "long", 30)
+	m, _ = send(t, m, mailArrivedMsg{})
+	m = sizedModel(t, m, 100, 20)
+
+	m, _ = send(t, m, special(tea.KeyTab))
+	for range 100 {
+		m, _ = send(t, m, key('j'))
+	}
+	if m.scroll == 0 {
+		t.Fatal("precondition: scroll = 0, so nothing was scrolled")
+	}
+
+	m = sizedModel(t, m, 100, 100)
+	if m.scroll > m.maxScroll() {
+		t.Errorf("scroll = %d, past the limit of %d for the new size", m.scroll, m.maxScroll())
+	}
+}
+
+// New mail must not move the content of the message being read, any more than
+// it moves the selection.
+func TestArrivalDoesNotDisturbScroll(t *testing.T) {
+	m, st := newModel(t)
+	addLong(t, st, "older", 200)
+	add(t, st, "newer")
+	m, _ = send(t, m, mailArrivedMsg{})
+	m = sizedModel(t, m, 100, 30)
+
+	m, _ = send(t, m, key('j')) // onto "older"
+	m, _ = send(t, m, special(tea.KeyTab))
+	for range 7 {
+		m, _ = send(t, m, key('j'))
+	}
+	if m.scroll != 7 {
+		t.Fatalf("precondition: scroll = %d, want 7", m.scroll)
+	}
+
+	add(t, st, "newest")
+	m, _ = send(t, m, mailArrivedMsg{})
+
+	if got := selectedSubject(t, m); got != "older" {
+		t.Fatalf("selected = %q, want %q", got, "older")
+	}
+	if m.scroll != 7 {
+		t.Errorf("scroll = %d after an arrival, want it left at 7", m.scroll)
+	}
+}
+
+// An empty inbox has nothing to scroll and no size to scroll it in. Pressing
+// the movement keys anyway must not put the model into a state the renderer
+// cannot draw.
+func TestScrollingAnEmptyInboxIsHarmless(t *testing.T) {
+	m, _ := newModel(t)
+	m = sizedModel(t, m, 100, 30)
+
+	m, _ = send(t, m, special(tea.KeyTab))
+	for range 5 {
+		m, _ = send(t, m, key('j'))
+	}
+	if m.scroll != 0 {
+		t.Errorf("scroll = %d with no messages, want 0", m.scroll)
+	}
+	if out := m.render(); out == "" {
+		t.Error("the empty inbox rendered nothing")
 	}
 }

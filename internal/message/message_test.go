@@ -314,4 +314,331 @@ func TestCloneKeepsNilSlicesNil(t *testing.T) {
 	if clone.HeaderTo != nil {
 		t.Errorf("HeaderTo = %v, want nil", clone.HeaderTo)
 	}
+	if clone.Headers != nil {
+		t.Errorf("Headers = %v, want nil", clone.Headers)
+	}
+	if clone.Attachments != nil {
+		t.Errorf("Attachments = %v, want nil", clone.Attachments)
+	}
+}
+
+// TestCloneDoesNotAliasHeadersOrAttachments is the ownership test for the two
+// slice fields inspection added. Without a clone of each, a consumer editing
+// what the store handed it would edit what the store holds.
+func TestCloneDoesNotAliasHeadersOrAttachments(t *testing.T) {
+	original := captureFixture(t, "attachments.eml")
+	original.Headers = append(original.Headers, Header{Key: "X-Extra", Value: "kept"})
+
+	if len(original.Headers) == 0 || len(original.Attachments) == 0 {
+		t.Fatal("fixture has no headers or attachments; the test would prove nothing")
+	}
+
+	clone := original.Clone()
+
+	if len(clone.Headers) != len(original.Headers) || len(clone.Attachments) != len(original.Attachments) {
+		t.Fatalf("Clone carried over %d headers and %d attachments, want %d and %d",
+			len(clone.Headers), len(clone.Attachments), len(original.Headers), len(original.Attachments))
+	}
+	if clone.Headers[0] != original.Headers[0] || clone.Attachments[0] != original.Attachments[0] {
+		t.Error("Clone did not carry the header and attachment contents over")
+	}
+
+	// Writing through every element of the copy, and appending to it, must
+	// leave the original exactly as it was.
+	wantHeader := original.Headers[0]
+	wantAttachment := original.Attachments[0]
+
+	for i := range clone.Headers {
+		clone.Headers[i] = Header{Key: "X-Mutated", Value: "mutated"}
+	}
+	for i := range clone.Attachments {
+		clone.Attachments[i] = Attachment{Filename: "mutated", ContentType: "mutated", Size: -1}
+	}
+	clone.Headers = append(clone.Headers, Header{Key: "X-Appended"})
+	clone.Attachments = append(clone.Attachments, Attachment{Filename: "appended"})
+
+	if original.Headers[0] != wantHeader {
+		t.Errorf("Headers is shared: %+v, want %+v", original.Headers[0], wantHeader)
+	}
+	if original.Attachments[0] != wantAttachment {
+		t.Errorf("Attachments is shared: %+v, want %+v", original.Attachments[0], wantAttachment)
+	}
+	for _, h := range original.Headers {
+		if h.Key == "X-Mutated" || h.Key == "X-Appended" {
+			t.Errorf("Headers is shared: %+v", original.Headers)
+			break
+		}
+	}
+	for _, a := range original.Attachments {
+		if a.Filename == "mutated" || a.Filename == "appended" {
+			t.Errorf("Attachments is shared: %+v", original.Attachments)
+			break
+		}
+	}
+}
+
+// --- header preservation -------------------------------------------------
+
+// findHeaders returns every value stored under key, in order, so a test can ask
+// about a repeated header without assuming where in the block it sits.
+func findHeaders(msg *Message, key string) []string {
+	var out []string
+	for _, h := range msg.Headers {
+		if strings.EqualFold(h.Key, key) {
+			out = append(out, h.Value)
+		}
+	}
+	return out
+}
+
+// headerKeys is the header block's shape: what was there, in what order.
+func headerKeys(msg *Message) []string {
+	keys := make([]string, 0, len(msg.Headers))
+	for _, h := range msg.Headers {
+		keys = append(keys, h.Key)
+	}
+	return keys
+}
+
+// The headers the structured fields do not cover are the reason Headers exists:
+// a developer inspecting a captured mail is usually looking for one of these.
+func TestCapturePreservesHeadersForInspection(t *testing.T) {
+	msg := captureFixture(t, "headers.eml")
+
+	for _, want := range []string{"Received", "Date", "Message-ID", "MIME-Version", "Content-Type", "Content-Transfer-Encoding", "X-Mailer"} {
+		if len(findHeaders(msg, want)) == 0 {
+			t.Errorf("header %q was not preserved; block is %q", want, headerKeys(msg))
+		}
+	}
+
+	if got := findHeaders(msg, "Message-ID"); len(got) != 1 || got[0] != "<trace-1@app.test>" {
+		t.Errorf("Message-ID = %q, want [<trace-1@app.test>]", got)
+	}
+	if got := findHeaders(msg, "Content-Transfer-Encoding"); len(got) != 1 || got[0] != "7bit" {
+		t.Errorf("Content-Transfer-Encoding = %q, want [7bit]", got)
+	}
+}
+
+// The header block is a sequence, and reading a Received trace depends on that
+// sequence surviving intact.
+func TestCapturePreservesHeaderOrder(t *testing.T) {
+	msg := captureFixture(t, "headers.eml")
+
+	want := []string{
+		"Received", "Received", "Date", "Message-ID", "MIME-Version",
+		"From", "To", "Subject", "X-Mailer", "X-Tag", "X-Tag", "X-Empty",
+		"Content-Type", "Content-Transfer-Encoding",
+	}
+	if !equalStrings(headerKeys(msg), want) {
+		t.Errorf("header keys =\n %q\nwant\n %q", headerKeys(msg), want)
+	}
+}
+
+// A map-shaped representation would quietly lose one of each of these pairs,
+// which is exactly the information a delivery trace is made of.
+func TestCaptureKeepsRepeatedHeadersApart(t *testing.T) {
+	msg := captureFixture(t, "headers.eml")
+
+	received := findHeaders(msg, "Received")
+	if len(received) != 2 {
+		t.Fatalf("Received appears %d times, want 2: %q", len(received), received)
+	}
+	if !strings.Contains(received[0], "id 0001") {
+		t.Errorf("first Received = %q, want the most recent hop", received[0])
+	}
+	if !strings.Contains(received[1], "from app.test") {
+		t.Errorf("second Received = %q, want the earlier hop", received[1])
+	}
+
+	if got, want := findHeaders(msg, "X-Tag"), []string{"alpha", "beta"}; !equalStrings(got, want) {
+		t.Errorf("X-Tag = %q, want %q", got, want)
+	}
+}
+
+// A folded header is one field, and it has to read as one field. The exact
+// bytes, folding included, stay in Raw.
+func TestCaptureUnfoldsHeaderValues(t *testing.T) {
+	msg := captureFixture(t, "headers.eml")
+
+	got := findHeaders(msg, "Received")[0]
+	if strings.ContainsAny(got, "\r\n") {
+		t.Errorf("Received still contains a line break: %q", got)
+	}
+	for _, want := range []string{"from client.test", "by catcher.test", "Sat, 29 Aug 2026 09:58:00 +0000"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Received = %q, want it to contain %q", got, want)
+		}
+	}
+
+	// The folding itself must still be recoverable from the captured bytes.
+	if !strings.Contains(string(msg.Raw), "id 0001;\r\n\t") {
+		t.Error("Raw no longer shows the original folding")
+	}
+}
+
+// Canonicalising the key would show a developer a spelling their mail library
+// never emitted, which defeats the point of an inspector.
+func TestCaptureKeepsOriginalHeaderCasing(t *testing.T) {
+	msg := captureFixture(t, "headers.eml")
+
+	for _, want := range []string{"MIME-Version", "Message-ID"} {
+		found := false
+		for _, h := range msg.Headers {
+			if h.Key == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no header spelled %q; block is %q", want, headerKeys(msg))
+		}
+	}
+}
+
+// A valueless header is still a header, and dropping it would misrepresent what
+// was sent.
+func TestCaptureKeepsEmptyHeaderValue(t *testing.T) {
+	msg := captureFixture(t, "headers.eml")
+
+	got := findHeaders(msg, "X-Empty")
+	if len(got) != 1 {
+		t.Fatalf("X-Empty appears %d times, want 1", len(got))
+	}
+	if got[0] != "" {
+		t.Errorf("X-Empty = %q, want an empty value", got[0])
+	}
+}
+
+// A message we cannot parse has no header block to show, and must say so by
+// being empty rather than by panicking somewhere downstream.
+func TestCaptureMalformedHasNoHeadersOrAttachments(t *testing.T) {
+	msg := Capture(testEnvelope, loadFixture(t, "malformed.eml"), receivedAt)
+
+	if msg.ParseError == nil {
+		t.Fatal("precondition: ParseError = nil, want a failure")
+	}
+	if msg.Headers != nil {
+		t.Errorf("Headers = %q, want nil", msg.Headers)
+	}
+	if msg.Attachments != nil {
+		t.Errorf("Attachments = %v, want nil", msg.Attachments)
+	}
+}
+
+// --- attachment metadata -------------------------------------------------
+
+func TestCaptureAttachmentMetadata(t *testing.T) {
+	msg := captureFixture(t, "attachments.eml")
+
+	if len(msg.Attachments) != 2 {
+		t.Fatalf("Attachments = %d, want 2: %+v", len(msg.Attachments), msg.Attachments)
+	}
+
+	pdf := msg.Attachments[0]
+	// The filename is an RFC 2047 encoded-word in the fixture; showing it
+	// undecoded would be worse than showing nothing.
+	if want := "rapport café.pdf"; pdf.Filename != want {
+		t.Errorf("Attachments[0].Filename = %q, want %q", pdf.Filename, want)
+	}
+	if want := "application/pdf"; pdf.ContentType != want {
+		t.Errorf("Attachments[0].ContentType = %q, want %q", pdf.ContentType, want)
+	}
+	if want := "attachment"; pdf.Disposition != want {
+		t.Errorf("Attachments[0].Disposition = %q, want %q", pdf.Disposition, want)
+	}
+	// Size is the decoded payload, not the base64 that carried it: the fixture
+	// sends 12 bytes on the wire for 9 bytes of PDF.
+	if want := int64(len("%PDF-1.4\n")); pdf.Size != want {
+		t.Errorf("Attachments[0].Size = %d, want %d (the decoded length)", pdf.Size, want)
+	}
+
+	bin := msg.Attachments[1]
+	// No filename in the disposition, so the discouraged Content-Type name is
+	// the only thing the sender gave us and is better than nothing.
+	if want := "notes.bin"; bin.Filename != want {
+		t.Errorf("Attachments[1].Filename = %q, want %q", bin.Filename, want)
+	}
+	if want := "application/octet-stream"; bin.ContentType != want {
+		t.Errorf("Attachments[1].ContentType = %q, want %q", bin.ContentType, want)
+	}
+	if want := int64(len("0123456789")); bin.Size != want {
+		t.Errorf("Attachments[1].Size = %d, want %d", bin.Size, want)
+	}
+
+	// The body must still be a body.
+	if want := "Both files are attached."; !strings.Contains(msg.TextBody, want) {
+		t.Errorf("TextBody = %q, want it to contain %q", msg.TextBody, want)
+	}
+	// And no payload may have been kept anywhere it does not belong.
+	if strings.Contains(msg.TextBody, "0123456789") || strings.Contains(msg.HTMLBody, "0123456789") {
+		t.Errorf("attachment payload leaked into a body:\ntext: %q\nhtml: %q", msg.TextBody, msg.HTMLBody)
+	}
+}
+
+// The common real-world shape: an alternative pair nested inside a mixed part
+// alongside one attachment.
+func TestCaptureMultipartMixedAttachmentMetadata(t *testing.T) {
+	msg := captureFixture(t, "mixed.eml")
+
+	if len(msg.Attachments) != 1 {
+		t.Fatalf("Attachments = %d, want 1: %+v", len(msg.Attachments), msg.Attachments)
+	}
+	att := msg.Attachments[0]
+	if att.Filename != "report.csv" || att.ContentType != "text/csv" || att.Disposition != "attachment" {
+		t.Errorf("Attachments[0] = %+v, want report.csv / text/csv / attachment", att)
+	}
+	if att.Size <= 0 {
+		t.Errorf("Attachments[0].Size = %d, want the size of the CSV", att.Size)
+	}
+	if att.ContentID != "" {
+		t.Errorf("Attachments[0].ContentID = %q, want empty: the part has no Content-ID", att.ContentID)
+	}
+}
+
+// An embedded image is dispositioned inline, which the MIME reader treats the
+// same way it treats body text. It is neither: putting it in TextBody would
+// splice binary into the preview, and calling it a plain attachment would hide
+// that the HTML refers to it.
+func TestCaptureInlinePartIsNotBodyText(t *testing.T) {
+	msg := captureFixture(t, "inline.eml")
+
+	if want := `<img src="cid:logo@app.test">`; !strings.Contains(msg.HTMLBody, want) {
+		t.Errorf("HTMLBody = %q, want it to contain %q", msg.HTMLBody, want)
+	}
+	if msg.TextBody != "" {
+		t.Errorf("TextBody = %q, want empty: the image is not body text", msg.TextBody)
+	}
+
+	if len(msg.Attachments) != 1 {
+		t.Fatalf("Attachments = %d, want the inline image: %+v", len(msg.Attachments), msg.Attachments)
+	}
+	got := msg.Attachments[0]
+	if got.Filename != "logo.png" || got.ContentType != "image/png" {
+		t.Errorf("Attachments[0] = %+v, want logo.png / image/png", got)
+	}
+	// Recorded as inline, not as an attachment: a viewer has to be able to tell
+	// a cid: image apart from a file the sender meant to send.
+	if want := "inline"; got.Disposition != want {
+		t.Errorf("Attachments[0].Disposition = %q, want %q", got.Disposition, want)
+	}
+	// The Content-ID is what ties it to the cid: URL in the HTML, and is kept
+	// without its angle brackets so the two compare directly.
+	if want := "logo@app.test"; got.ContentID != want {
+		t.Errorf("Attachments[0].ContentID = %q, want %q", got.ContentID, want)
+	}
+	if want := int64(len("hello-png")); got.Size != want {
+		t.Errorf("Attachments[0].Size = %d, want %d", got.Size, want)
+	}
+}
+
+// A plain text or HTML part is body text even though it carries the same MIME
+// metadata an attachment does. Nothing here may become an attachment.
+func TestCaptureTextPartsAreNeverAttachments(t *testing.T) {
+	for _, name := range []string{"plaintext.eml", "html.eml", "alternative.eml", "encoded.eml", "headers.eml"} {
+		t.Run(name, func(t *testing.T) {
+			msg := captureFixture(t, name)
+			if len(msg.Attachments) != 0 {
+				t.Errorf("Attachments = %+v, want none", msg.Attachments)
+			}
+		})
+	}
 }

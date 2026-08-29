@@ -1,0 +1,18 @@
+Received: from client.test (client.test [10.0.0.9])
+	by catcher.test with ESMTP id 0001;
+	Sat, 29 Aug 2026 09:58:00 +0000
+Received: from app.test by client.test; Sat, 29 Aug 2026 09:57:00 +0000
+Date: Sat, 29 Aug 2026 10:00:00 +0000
+Message-ID: <trace-1@app.test>
+MIME-Version: 1.0
+From: ops@app.test
+To: ivan@example.test
+Subject: Delivery trace
+X-Mailer: mailtui-test/1.0
+X-Tag: alpha
+X-Tag: beta
+X-Empty:
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Look at the headers, not the body.

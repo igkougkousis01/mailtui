@@ -35,12 +35,29 @@ func add(t *testing.T, s *Store, subject string) string {
 }
 
 // capture builds a well-formed message whose subject names it.
+//
+// It carries an attachment and a custom header so that every slice field on
+// Message is non-empty, which is what the ownership tests need in order to
+// prove anything about them. Nothing in it contains a literal X: the ownership
+// tests scribble that letter over Raw and then check it is not there.
 func capture(subject string) *message.Message {
 	raw := "From: sender@example.test\r\n" +
 		"To: recipient@example.test\r\n" +
 		"Subject: " + subject + "\r\n" +
+		"Trace-Id: " + subject + "\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/mixed; boundary=\"b\"\r\n" +
 		"\r\n" +
-		"body\r\n"
+		"--b\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"body\r\n" +
+		"--b\r\n" +
+		"Content-Type: text/csv; charset=utf-8\r\n" +
+		"Content-Disposition: attachment; filename=\"data.csv\"\r\n" +
+		"\r\n" +
+		"a,b\r\n" +
+		"--b--\r\n"
 
 	return message.Capture(
 		message.Envelope{From: "envelope@example.test", To: []string{"rcpt@example.test"}},

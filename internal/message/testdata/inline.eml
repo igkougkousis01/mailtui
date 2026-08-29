@@ -1,0 +1,18 @@
+From: newsletter@app.test
+To: gina@example.test
+Subject: Inline logo
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="rel-boundary"
+
+--rel-boundary
+Content-Type: text/html; charset=utf-8
+
+<p>Hello <img src="cid:logo@app.test"></p>
+--rel-boundary
+Content-Type: image/png; name="logo.png"
+Content-Disposition: inline; filename="logo.png"
+Content-ID: <logo@app.test>
+Content-Transfer-Encoding: base64
+
+aGVsbG8tcG5n
+--rel-boundary--

@@ -41,6 +41,16 @@ const (
 	// paneChrome is the horizontal cells a pane spends on itself: a border
 	// column and a padding column on each side.
 	paneChrome = 4
+
+	// maxDisplayBytes bounds how much of a decoded text body one rebuild turns
+	// into wrapped lines.
+	//
+	// It does not apply to Raw, which is windowed instead and stays navigable
+	// to its last byte however large it is — see rawview.go. A text body is
+	// different: it is a decoded part rather than the whole payload, it is
+	// rarely large, and the message says on screen when it was cut. Nothing is
+	// dropped from what is stored either way.
+	maxDisplayBytes = 256 << 10
 )
 
 // Colours are ANSI palette indices rather than hex, so the terminal's own
@@ -48,16 +58,19 @@ const (
 // light background as well as a dark one.
 var (
 	// borderColour is shared by the pane borders and the rule inside the
-	// preview, so the two never drift apart.
+	// preview, so the two never drift apart. focusColour marks the pane the
+	// movement keys are pointed at.
 	borderColour = lipgloss.Color("8")
+	focusColour  = lipgloss.Color("6")
 
 	styleAppName   = lipgloss.NewStyle().Bold(true)
 	styleDim       = lipgloss.NewStyle().Foreground(borderColour)
 	styleBorder    = lipgloss.NewStyle().Foreground(borderColour)
 	stylePaneTitle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("4"))
-	styleSelected  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
+	styleSelected  = lipgloss.NewStyle().Bold(true).Foreground(focusColour)
 	styleOnline    = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 	styleWarn      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("1"))
+	styleLabel     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("4"))
 
 	// styleSelectedWarn is the cursor sitting on a message that failed to
 	// parse: the warning colour wins, the cursor arrow carries the selection.
@@ -113,8 +126,54 @@ func (m Model) renderHeader(w int) string {
 	return left + strings.Repeat(" ", gap) + right
 }
 
+// renderFooter is the whole key map on one row: which view of the message is
+// showing and how to reach the others, then what the movement keys do right
+// now. It is where the active mode is stated in words.
+//
+// Both halves are dropped in order of how much they are needed as the terminal
+// narrows, rather than being truncated mid-word.
 func (m Model) renderFooter(w int) string {
-	return styleDim.Render(fitLine("↑/↓ · j/k  navigate     q  quit", w))
+	if len(m.msgs) == 0 {
+		return styleDim.Render(fitLine("q  quit", w))
+	}
+
+	left := m.renderModeBar()
+	right := styleDim.Render(m.navHint())
+
+	if gap := w - ansi.StringWidth(left) - ansi.StringWidth(right); gap >= 2 {
+		return left + strings.Repeat(" ", gap) + right
+	}
+	if ansi.StringWidth(left) <= w {
+		return fitLine(left, w)
+	}
+	// Too narrow even for the key list. Which view is on screen is the part
+	// that cannot be guessed from looking at it, so that is what survives.
+	return styleSelected.Render(fitLine(m.mode.String(), w))
+}
+
+// renderModeBar lists the four views and their keys, with the active one
+// picked out. Naming the key next to the view is the whole instruction manual
+// for switching between them.
+func (m Model) renderModeBar() string {
+	parts := make([]string, 0, len(modes))
+	for _, mode := range modes {
+		label := mode.key + " " + mode.name
+		if mode.mode == m.mode {
+			parts = append(parts, styleSelected.Render(label))
+			continue
+		}
+		parts = append(parts, styleDim.Render(label))
+	}
+	return strings.Join(parts, styleDim.Render(" · "))
+}
+
+// navHint says what j and k do, which depends on where tab last left the
+// focus. Stating it beats expecting anyone to remember.
+func (m Model) navHint() string {
+	if m.focus == focusInspect {
+		return "tab inbox · j/k scroll · q quit"
+	}
+	return "tab view · j/k messages · q quit"
 }
 
 // renderBody draws the panes into exactly w by h cells.
@@ -122,7 +181,7 @@ func (m Model) renderBody(w, h int) string {
 	if len(m.msgs) == 0 {
 		// One full-width pane rather than two: an empty inbox has nothing to
 		// put on either side of a divider.
-		return pane("Inbox", m.emptyStateLines(), w, h)
+		return paneSpec{title: "Inbox", content: m.emptyStateLines()}.render(w, h)
 	}
 
 	if w < narrowWidth {
@@ -130,8 +189,8 @@ func (m Model) renderBody(w, h int) string {
 	}
 
 	listW := listWidth(w)
-	list := pane("Inbox", m.listLines(listW-paneChrome, paneRows(h), listRowHeight), listW, h)
-	preview := pane("Message", m.previewLines(w-listW-paneChrome), w-listW, h)
+	list := m.listPane().render(listW, h)
+	preview := m.inspectPane().render(w-listW, h)
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, list, preview)
 }
@@ -144,6 +203,25 @@ func (m Model) renderBody(w, h int) string {
 // panes down — so spending a row per entry to repeat it costs more than it
 // gives.
 func (m Model) renderStacked(w, h int) string {
+	listH := stackedListHeight(h)
+
+	previewH := h - listH
+	if previewH < 5 {
+		// Not enough room for two boxes. The message is the one worth keeping:
+		// the list is navigation, and navigation still works blind.
+		return m.inspectPane().render(w, h)
+	}
+
+	list := m.listPane().render(w, listH)
+	preview := m.inspectPane().render(w, previewH)
+
+	return lipgloss.JoinVertical(lipgloss.Left, list, preview)
+}
+
+// stackedListHeight is the inbox pane's share of a stacked layout: about a
+// third, but never so little that the cursor has nowhere to move nor so much
+// that the message is squeezed.
+func stackedListHeight(h int) int {
 	listH := h/3 + paneHeaderRows
 	if listH < 5 {
 		listH = 5
@@ -151,18 +229,156 @@ func (m Model) renderStacked(w, h int) string {
 	if listH > 10 {
 		listH = 10
 	}
+	return listH
+}
 
-	previewH := h - listH
-	if previewH < 5 {
-		// Not enough room for two boxes. The message is the one worth keeping:
-		// the list is navigation, and navigation still works blind.
-		return pane("Message", m.previewLines(w-paneChrome), w, h)
+// listPane is the inbox pane, sized by whichever layout is drawing it.
+func (m Model) listPane() paneSpec {
+	rowHeight := listRowHeight
+	if m.width < narrowWidth {
+		rowHeight = compactRowHeight
 	}
 
-	list := pane("Inbox", m.listLines(w-paneChrome, paneRows(listH), compactRowHeight), w, listH)
-	preview := pane("Message", m.previewLines(w-paneChrome), w, previewH)
+	return paneSpec{
+		title:   "Inbox",
+		note:    fmt.Sprintf("%d/%d", m.cursor+1, len(m.msgs)),
+		focused: m.focus == focusInbox,
+		layout: func(inner, rows int) []string {
+			return m.listLines(inner, rows, rowHeight)
+		},
+	}
+}
 
-	return lipgloss.JoinVertical(lipgloss.Left, list, preview)
+// inspectPane is the message pane: the current mode's lines, scrolled to where
+// the reader left them.
+//
+// The scroll position goes in the pane's note, because a pane showing rows 40
+// to 60 of a raw message is otherwise indistinguishable from one showing the
+// whole thing.
+func (m Model) inspectPane() paneSpec {
+	content := m.inspectContent()
+
+	note := ""
+	if _, rows := m.inspectSize(); rows > 0 && content.len() > rows {
+		note = fmt.Sprintf("%d-%d/%d", m.scroll+1, min(m.scroll+rows, content.len()), content.len())
+	}
+
+	return paneSpec{
+		title:   "Message · " + m.mode.String(),
+		note:    note,
+		focused: m.focus == focusInspect,
+		layout: func(inner, rows int) []string {
+			return content.window(m.scroll, rows)
+		},
+	}
+}
+
+// inspectSize is the inner width and row count of the inspection pane at the
+// current terminal size — the same numbers renderBody hands to a paneSpec.
+//
+// Update needs them to know how far the content may be scrolled, and View
+// needs them to draw it. Deriving both from one function is what stops the
+// scroll offset and the visible window from disagreeing.
+func (m Model) inspectSize() (w, rows int) {
+	if m.width < minWidth || m.height < minHeight || len(m.msgs) == 0 {
+		return 0, 0
+	}
+
+	h := m.height - 2 // the title bar and the footer
+
+	if m.width < narrowWidth {
+		previewH := h - stackedListHeight(h)
+		if previewH < 5 {
+			previewH = h
+		}
+		return m.width - paneChrome, max(paneRows(previewH), 0)
+	}
+
+	return m.width - listWidth(m.width) - paneChrome, max(paneRows(h), 0)
+}
+
+// inspectContent is what the inspection pane has to show, and the only thing
+// the scroll offset is measured against.
+//
+// Every mode but Raw renders its lines up front: a parsed message is small, it
+// is already in memory, and slicing a []string is the cheapest possible frame.
+// Raw cannot, because the payload may be tens of megabytes, so it carries an
+// index instead and produces rows on demand. Both answer the same two
+// questions, which is all the pane and the scroll arithmetic ever ask.
+type inspectContent struct {
+	// lines is the whole content for every mode but Raw, where it is the
+	// banner above the payload.
+	lines []string
+
+	// raw supplies the rows below lines. It is nil except in Raw mode.
+	raw *rawView
+}
+
+// len is how many rows the content has in total.
+func (c inspectContent) len() int {
+	if c.raw == nil {
+		return len(c.lines)
+	}
+	return len(c.lines) + c.raw.rows
+}
+
+// window returns rows [offset, offset+count) — the rows the pane is about to
+// draw, and in Raw mode the only ones that are rendered at all.
+func (c inspectContent) window(offset, count int) []string {
+	if count <= 0 {
+		return nil
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	head := c.lines[min(offset, len(c.lines)):min(offset+count, len(c.lines))]
+	if c.raw == nil {
+		return head
+	}
+
+	tail := c.raw.lines(max(offset-len(c.lines), 0), count-len(head))
+	if len(head) == 0 {
+		return tail
+	}
+	// A fresh slice rather than appending to head, which is a view into
+	// c.lines and would have the banner's spare capacity written over.
+	return append(append(make([]string, 0, len(head)+len(tail)), head...), tail...)
+}
+
+// inspectContent returns the pane's content, using what Update already built
+// when it still describes this model and building it here when it does not.
+// See Model.syncContent.
+func (m Model) inspectContent() inspectContent {
+	if m.currentContentKey() == m.contentKey {
+		return m.content
+	}
+	w, _ := m.inspectSize()
+	return m.buildInspect(w)
+}
+
+// buildInspect prepares the selected message in the current mode for a pane w
+// cells wide.
+func (m Model) buildInspect(w int) inspectContent {
+	if w <= 0 {
+		return inspectContent{}
+	}
+
+	msg, ok := m.selected()
+	if !ok {
+		return inspectContent{lines: m.emptyStateLines()}
+	}
+
+	switch m.mode {
+	case modeHeaders:
+		return inspectContent{lines: headerModeLines(msg, w)}
+	case modeRaw:
+		return rawModeContent(msg, w)
+	case modeAttachments:
+		return inspectContent{lines: attachmentModeLines(msg, w)}
+	default:
+		return inspectContent{lines: bodyModeLines(msg, w)}
+	}
 }
 
 // paneRows is how many rows of content a pane of total height h can show,
@@ -219,6 +435,8 @@ func (m Model) listLines(w, h, rowHeight int) []string {
 		flag := "  "
 		if msg.ParseError != nil {
 			flag = "! "
+		} else if len(msg.Attachments) > 0 {
+			flag = "@ "
 		}
 
 		subject := fitLine(cursor+flag+sanitizeLine(subjectOf(msg)), w)
@@ -264,27 +482,19 @@ func (m Model) listWindow(h, rowHeight int) (start, end int) {
 	return start, end
 }
 
-// previewLines renders the selected message: the parse warning if there is
-// one, then the headers, the envelope, and the body.
-func (m Model) previewLines(w int) []string {
-	msg, ok := m.selected()
-	if !ok {
-		return m.emptyStateLines()
-	}
-
+// bodyModeLines renders the selected message the way a mail client would: the
+// parse warning if there is one, then the headers a reader cares about, the
+// envelope, and the body.
+//
+// This is the one view that mixes the SMTP envelope in with the message's own
+// headers, and it does so with the two labelled apart. Headers mode shows the
+// header block alone, because that block is a record of what was sent and the
+// envelope was never part of it.
+func bodyModeLines(msg message.Message, w int) []string {
 	var lines []string
 
 	if msg.ParseError != nil {
-		// First, and loud: everything below it is partial, and knowing that
-		// changes how it should be read.
-		lines = append(lines, styleWarn.Render(fitLine("! This message could not be parsed.", w)))
-		for _, l := range wrapLines(sanitizeLine(msg.ParseError.Error()), w) {
-			lines = append(lines, styleWarn.Render(l))
-		}
-		for _, l := range wrapLines("The raw bytes were captured in full and are retained.", w) {
-			lines = append(lines, styleDim.Render(l))
-		}
-		lines = append(lines, "")
+		lines = append(lines, parseWarningLines(msg, w)...)
 	}
 
 	lines = append(lines, fieldLines("Subject", subjectOf(msg), w)...)
@@ -296,6 +506,134 @@ func (m Model) previewLines(w int) []string {
 	lines = append(lines, bodyLines(msg, w)...)
 
 	return lines
+}
+
+// parseWarningLines is the banner a message that failed to parse carries: what
+// went wrong, and that nothing was thrown away because of it.
+func parseWarningLines(msg message.Message, w int) []string {
+	lines := []string{styleWarn.Render(fitLine("! This message could not be parsed.", w))}
+	for _, l := range wrapLines(sanitizeLine(msg.ParseError.Error()), w) {
+		lines = append(lines, styleWarn.Render(l))
+	}
+	for _, l := range wrapLines("The raw bytes were captured in full and are retained. Press r to read them.", w) {
+		lines = append(lines, styleDim.Render(l))
+	}
+	return append(lines, "")
+}
+
+// headerModeLines renders the message's own header block, in the order it was
+// written, with repeats intact. Nothing is reconstructed: these are the fields
+// the parser read, not a rendering of the handful of them Message names.
+func headerModeLines(msg message.Message, w int) []string {
+	if len(msg.Headers) == 0 {
+		var lines []string
+		if msg.ParseError != nil {
+			lines = append(lines, parseWarningLines(msg, w)...)
+		}
+		return append(lines, wrapLines(styleDim.Render("No headers could be read."), w)...)
+	}
+
+	lines := []string{
+		styleDim.Render(fitLine(plural(len(msg.Headers), "header field", "header fields"), w)),
+		"",
+	}
+	for _, h := range msg.Headers {
+		lines = append(lines, headerFieldLines(h, w)...)
+	}
+	return lines
+}
+
+// headerFieldLines renders one header field. A field that fits goes on one
+// row; one that does not puts its name on a row of its own and indents the
+// value below it, which keeps a long Received line readable as a block instead
+// of as a paragraph with a ragged first line.
+func headerFieldLines(h message.Header, w int) []string {
+	key := sanitizeLine(h.Key)
+	value := sanitizeLine(h.Value)
+
+	if value == "" {
+		return []string{fitLine(styleLabel.Render(key+":")+" "+styleDim.Render("(empty)"), w)}
+	}
+
+	if len(key)+2+ansi.StringWidth(value) <= w {
+		return []string{fitLine(styleLabel.Render(key+":")+" "+value, w)}
+	}
+
+	lines := []string{fitLine(styleLabel.Render(key+":"), w)}
+	for _, l := range wrapLines(value, w-2) {
+		lines = append(lines, "  "+l)
+	}
+	return lines
+}
+
+// rawModeContent prepares the captured bytes for display.
+//
+// The bytes themselves are never regenerated and never re-encoded: this is
+// Message.Raw, the DATA payload exactly as it arrived, and the whole of it stays
+// reachable however large it is. What happens here is display normalisation and
+// nothing else — a carriage return never reaches the terminal, control
+// characters are dropped so the message cannot drive the cursor, and long lines
+// are cut to the pane so it keeps its shape. All of that happens a screenful at
+// a time, in rawView; the stored message is untouched by any of it.
+func rawModeContent(msg message.Message, w int) inspectContent {
+	banner := []string{
+		styleWarn.Render(fitLine("RAW  "+formatBytes(int64(len(msg.Raw)))+"  exactly as captured", w)),
+		"",
+	}
+
+	if len(msg.Raw) == 0 {
+		return inspectContent{lines: append(banner, wrapLines(styleDim.Render("(no bytes were captured)"), w)...)}
+	}
+	return inspectContent{lines: banner, raw: newRawView(msg.Raw, w)}
+}
+
+// attachmentModeLines lists what the message carried besides its body: one
+// entry per part, with what a developer checking their mail-sending code needs
+// to confirm — that the file is there, that it is the type they meant, that it
+// is not empty, and that an embedded image kept the Content-ID the HTML points
+// at.
+func attachmentModeLines(msg message.Message, w int) []string {
+	if len(msg.Attachments) == 0 {
+		lines := []string{styleDim.Render(fitLine("No attachments", w))}
+		if msg.ParseError != nil {
+			lines = append(lines, "")
+			lines = append(lines, wrapLines(styleDim.Render(
+				"This message could not be parsed, so its parts were never read. Press r for the raw bytes."), w)...)
+		}
+		return lines
+	}
+
+	lines := []string{
+		styleDim.Render(fitLine(plural(len(msg.Attachments), "attachment", "attachments"), w)),
+		"",
+	}
+	for i, att := range msg.Attachments {
+		lines = append(lines, attachmentLines(i+1, att, w)...)
+	}
+	return lines
+}
+
+// attachmentLines is one entry: its name on a row, then its metadata on a
+// dimmed row under it.
+func attachmentLines(n int, att message.Attachment, w int) []string {
+	name := sanitizeLine(att.Filename)
+	if strings.TrimSpace(name) == "" {
+		name = "(no filename)"
+	}
+
+	facts := []string{sanitizeLine(att.ContentType), formatBytes(att.Size)}
+	if att.Disposition != "" {
+		facts = append(facts, sanitizeLine(att.Disposition))
+	}
+	if att.ContentID != "" {
+		facts = append(facts, "cid: "+sanitizeLine(att.ContentID))
+	}
+
+	lines := []string{fitLine(fmt.Sprintf("%2d. ", n)+styleLabel.Render(name), w)}
+	for _, l := range wrapLines(strings.Join(facts, " · "), max(w-4, 1)) {
+		lines = append(lines, "    "+styleDim.Render(l))
+	}
+	return append(lines, "")
 }
 
 // fieldLines renders one labelled header field, wrapping a long value under a
@@ -330,7 +668,9 @@ func fieldLines(label, value string, w int) []string {
 // acknowledged rather than rendered: turning markup into terminal text is a
 // job of its own and not this milestone's.
 func bodyLines(msg message.Message, w int) []string {
-	text := strings.TrimSpace(sanitizeText(msg.TextBody))
+	clamped, dropped := clampForDisplay(msg.TextBody)
+
+	text := strings.TrimSpace(sanitizeText(clamped))
 	if text == "" {
 		switch {
 		case strings.TrimSpace(msg.HTMLBody) != "":
@@ -346,7 +686,50 @@ func bodyLines(msg message.Message, w int) []string {
 	for _, l := range strings.Split(text, "\n") {
 		lines = append(lines, wrapLines(l, w)...)
 	}
+
+	if dropped > 0 {
+		lines = append(lines, "")
+		lines = append(lines, wrapLines(styleDim.Render(fmt.Sprintf(
+			"… %s more not shown here. The message is stored in full.", formatBytes(int64(dropped)))), w)...)
+	}
 	return lines
+}
+
+// clampForDisplay cuts a decoded text body down to what one rebuild is willing
+// to wrap and reports how many bytes were left out, so the view can say so. It
+// cuts on a rune boundary, so the result is still valid text.
+func clampForDisplay(s string) (string, int) {
+	if len(s) <= maxDisplayBytes {
+		return s, 0
+	}
+
+	cut := maxDisplayBytes
+	for cut > 0 && !utf8Start(s[cut]) {
+		cut--
+	}
+	return s[:cut], len(s) - cut
+}
+
+// formatBytes renders a byte count for a human. Powers of ten rather than two,
+// because this number exists to be compared with what a file manager shows.
+func formatBytes(n int64) string {
+	switch {
+	case n < 1000:
+		return fmt.Sprintf("%d B", n)
+	case n < 1000*1000:
+		return fmt.Sprintf("%.1f kB", float64(n)/1000)
+	default:
+		return fmt.Sprintf("%.1f MB", float64(n)/1e6)
+	}
+}
+
+// plural renders a count with the right noun, because "1 attachments" reads as
+// a bug in the program rather than as a fact about the mail.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, one)
+	}
+	return fmt.Sprintf("%d %s", n, many)
 }
 
 // subjectOf is the subject a human should see. A message with no Subject
@@ -372,18 +755,43 @@ func senderOf(msg message.Message) string {
 	return "(unknown sender)"
 }
 
-// pane draws content inside a bordered box occupying exactly w by h cells,
-// with the title on its first inner row. Anything too small to hold a border
-// and a row of content renders as nothing rather than as garbage.
-func pane(title string, content []string, w, h int) string {
+// paneSpec is one bordered box: what it is called, what goes in it, and
+// whether the movement keys are pointed at it.
+//
+// The content arrives as a function of the box's inner size rather than as
+// lines, because neither pane knows how big it is until the layout has decided
+// — and the inbox chooses how many entries to draw from exactly that number.
+type paneSpec struct {
+	title string
+
+	// note is drawn right-aligned on the title row: a position, a count, the
+	// small print that says what part of the whole is on screen.
+	note string
+
+	// content is used when layout is nil, for a pane whose lines do not depend
+	// on its size.
+	content []string
+	layout  func(inner, rows int) []string
+
+	focused bool
+}
+
+// render draws the pane into exactly w by h cells. Anything too small to hold
+// a border and a row of content renders as nothing rather than as garbage.
+func (p paneSpec) render(w, h int) string {
 	inner := w - paneChrome
 	rows := h - 2
 	if inner < 1 || rows < 1 {
 		return ""
 	}
 
+	content := p.content
+	if p.layout != nil {
+		content = p.layout(inner, max(rows-paneHeaderRows, 0))
+	}
+
 	lines := make([]string, 0, rows)
-	lines = append(lines, stylePaneTitle.Render(fitLine(title, inner)))
+	lines = append(lines, p.titleRow(inner))
 	if rows > 1 {
 		lines = append(lines, "")
 	}
@@ -391,11 +799,32 @@ func pane(title string, content []string, w, h int) string {
 
 	body := strings.Join(fitBlock(lines, inner, rows), "\n")
 
+	colour := borderColour
+	if p.focused {
+		colour = focusColour
+	}
+
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColour).
+		BorderForeground(colour).
 		Padding(0, 1).
 		Render(body)
+}
+
+// titleRow puts the title on the left and the note on the right, dropping the
+// note rather than letting the two collide.
+func (p paneSpec) titleRow(inner int) string {
+	title := stylePaneTitle.Render(p.title)
+	if p.note == "" {
+		return fitLine(title, inner)
+	}
+
+	note := styleDim.Render(p.note)
+	gap := inner - ansi.StringWidth(title) - ansi.StringWidth(note)
+	if gap < 1 {
+		return fitLine(title, inner)
+	}
+	return title + strings.Repeat(" ", gap) + note
 }
 
 // fitBlock forces lines into exactly h rows of exactly w cells, padding with

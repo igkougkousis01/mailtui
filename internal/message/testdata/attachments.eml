@@ -1,0 +1,22 @@
+From: reports@app.test
+To: hana@example.test
+Subject: Two files
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mix"
+
+--mix
+Content-Type: text/plain; charset=utf-8
+
+Both files are attached.
+--mix
+Content-Type: application/pdf
+Content-Disposition: attachment; filename="=?utf-8?q?rapport_caf=C3=A9.pdf?="
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQK
+--mix
+Content-Type: application/octet-stream; name="notes.bin"
+Content-Disposition: attachment
+
+0123456789
+--mix--
