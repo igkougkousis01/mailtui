@@ -94,7 +94,7 @@ Exit codes:
        the inbox stopped on an error of its own
   2    usage or configuration error: a bad flag, an address that is not
        loopback, a port already in use
-  130  a waiting command was interrupted by SIGINT (Ctrl-C) or SIGTERM
+  130  a waiting command was interrupted (Ctrl-C; SIGTERM on macOS/Linux)
 
 Output:
   stdout carries the result and nothing else — no banners, no logs — so it can

@@ -244,10 +244,10 @@ func (m *Message) readBody(h *gomessage.Header, body io.Reader) error {
 // readAttachment records what the part says about itself and throws the payload
 // away.
 //
-// The bytes are counted through io.Discard rather than buffered: the size is
-// the only thing this milestone reports, and holding a second copy of every
-// attachment would double the memory a captured message costs for no gain. The
-// encoded original is still in Raw.
+// The bytes are counted through io.Discard rather than buffered: the attachment
+// view reports metadata, and holding a second copy of every attachment would
+// double the memory a captured message costs for no gain. The encoded original
+// is still in Raw.
 //
 // fallbackDisposition is how the part was classified when it declares no
 // Content-Disposition of its own.

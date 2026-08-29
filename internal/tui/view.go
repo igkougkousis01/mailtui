@@ -665,8 +665,8 @@ func fieldLines(label, value string, w int) []string {
 }
 
 // bodyLines renders the text body, or says why there isn't one. HTML is
-// acknowledged rather than rendered: turning markup into terminal text is a
-// job of its own and not this milestone's.
+// acknowledged rather than rendered: the Body view deliberately shows the
+// parsed plain-text alternative rather than interpreting markup.
 func bodyLines(msg message.Message, w int) []string {
 	clamped, dropped := clampForDisplay(msg.TextBody)
 

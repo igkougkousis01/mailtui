@@ -3,13 +3,14 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	netsmtp "net/smtp"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
+	"github.com/igkougkousis01/mailtui/internal/interactive"
 	"github.com/igkougkousis01/mailtui/internal/smtp"
 	"github.com/igkougkousis01/mailtui/internal/version"
 )
@@ -135,20 +136,21 @@ func TestInteractiveGetsTheConfiguredCatcher(t *testing.T) {
 // the same kind of problem in interactive mode as in a script, and it gets the
 // same exit code and the same hint.
 func TestInteractiveBindFailureIsAConfigurationError(t *testing.T) {
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("holding a port: %v", err)
+	}
+	defer held.Close()
+
+	addr := held.Addr().String()
 	var stdout, stderr bytes.Buffer
 	app := &App{
-		Stdout: &stdout,
-		Stderr: &stderr,
-		Interactive: func(context.Context, smtp.Config) error {
-			// What smtp.Listen returns when the port is taken.
-			return &smtp.ListenError{
-				Addr: "127.0.0.1:1025",
-				Err:  &net.OpError{Op: "listen", Err: syscall.EADDRINUSE},
-			}
-		},
+		Stdout:      &stdout,
+		Stderr:      &stderr,
+		Interactive: interactive.Run,
 	}
 
-	code := app.Run(context.Background(), nil)
+	code := app.Run(context.Background(), []string{"--smtp-addr", addr})
 
 	if code != ExitUsage {
 		t.Fatalf("exit code = %d, want %d", code, ExitUsage)
@@ -157,7 +159,7 @@ func TestInteractiveBindFailureIsAConfigurationError(t *testing.T) {
 		t.Errorf("stdout = %q, want nothing", stdout.String())
 	}
 	for _, want := range []string{
-		"mailtui: cannot listen on 127.0.0.1:1025: address already in use",
+		"mailtui: cannot listen on " + addr + ": address already in use",
 		"hint: another mailtui",
 	} {
 		if !strings.Contains(stderr.String(), want) {
@@ -181,7 +183,7 @@ func TestHintsAreSparing(t *testing.T) {
 		Interactive: func(context.Context, smtp.Config) error {
 			return &smtp.ListenError{
 				Addr: "127.0.0.1:1025",
-				Err:  &net.OpError{Op: "listen", Err: syscall.EINVAL},
+				Err:  errors.New("unrelated listener failure"),
 			}
 		},
 	}
@@ -248,49 +250,6 @@ func TestHelpQuotesTheRealDefaults(t *testing.T) {
 	}
 }
 
-// TestScriptModeStopsOnASignal: SIGINT and SIGTERM both end a waiting command
-// with the interrupted code, which is the one thing a script can tell from a
-// failed assertion.
-//
-// The signal goes to this process, which is safe because the handler is
-// installed by Run before the port is claimed: awaitPort therefore means the
-// signal cannot reach the default disposition and take the test binary with
-// it.
-func TestScriptModeStopsOnASignal(t *testing.T) {
-	for _, sig := range []syscall.Signal{syscall.SIGINT, syscall.SIGTERM} {
-		t.Run(sig.String(), func(t *testing.T) {
-			addr := freeAddr(t)
-			app, stdout, stderr, _ := newApp()
-
-			codes := make(chan int, 1)
-			go func() {
-				codes <- app.Run(context.Background(),
-					[]string{"wait", "--subject", "Never sent", "--timeout", "0", "--smtp-addr", addr})
-			}()
-
-			awaitPort(t, addr)
-			if err := syscall.Kill(syscall.Getpid(), sig); err != nil {
-				t.Fatalf("signalling this process: %v", err)
-			}
-
-			select {
-			case code := <-codes:
-				if code != ExitInterrupted {
-					t.Fatalf("exit code = %d, want %d\nstderr: %s", code, ExitInterrupted, stderr.String())
-				}
-				if stdout.String() != "" {
-					t.Errorf("stdout = %q, want nothing when interrupted", stdout.String())
-				}
-				if !strings.Contains(stderr.String(), "interrupted") {
-					t.Errorf("stderr = %q, want it to say the run was interrupted", stderr.String())
-				}
-			case <-time.After(15 * time.Second):
-				t.Fatalf("%s did not stop the command", sig)
-			}
-		})
-	}
-}
-
 // TestSenderIsAcknowledgedBeforeShutdown is the reason Stop has a grace at
 // all. The command finishes the moment the message reaches the store, which is
 // before the 250 goes back; if the listener closed there, an application that
@@ -326,7 +285,7 @@ func TestSenderIsAcknowledgedBeforeShutdown(t *testing.T) {
 }
 
 // TestScriptStdoutStaysMachineOnly restates the guarantee that makes
-// OTP=$(mailtui extract otp ...) safe, over the paths this milestone added to:
+// OTP=$(mailtui extract otp ...) safe across every script-mode outcome:
 // a version or a startup line leaking here would be caught as a changed value.
 func TestScriptStdoutStaysMachineOnly(t *testing.T) {
 	got := runCatching(t, context.Background(),

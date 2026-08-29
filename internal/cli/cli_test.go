@@ -283,9 +283,9 @@ func TestHelpGoesToStdout(t *testing.T) {
 	}
 }
 
-// TestHelpDocumentsTheContract keeps the promises this milestone makes where a
-// user can find them. The exact wording is free to change; that each subject
-// is covered is not.
+// TestHelpDocumentsTheContract keeps the command's promises where a user can
+// find them. The exact wording is free to change; that each subject is covered
+// is not.
 func TestHelpDocumentsTheContract(t *testing.T) {
 	help := run(t, "help").stdout
 

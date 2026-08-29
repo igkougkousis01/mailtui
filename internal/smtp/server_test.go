@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -62,7 +61,7 @@ func only(t *testing.T, st *store.Store) message.Message {
 	return list[0]
 }
 
-// TestDataAddsMessageToStore pins the milestone's central change: the outcome
+// TestDataAddsMessageToStore pins the catcher's central contract: the outcome
 // of DATA is a stored message, not a line of output.
 func TestDataAddsMessageToStore(t *testing.T) {
 	s, st, _ := newSession(t)
@@ -195,9 +194,9 @@ func TestDataStoresUnparsableMessage(t *testing.T) {
 	}
 }
 
-// TestDataNotifiesSubscribers is the end of the flow this milestone builds:
-// DATA reaches a consumer without anyone polling for it. The consumer is
-// handed an ID and fetches the message itself.
+// TestDataNotifiesSubscribers covers the end of the capture flow: DATA reaches
+// a consumer without anyone polling for it. The consumer is handed an ID and
+// fetches the message itself.
 func TestDataNotifiesSubscribers(t *testing.T) {
 	s, st, _ := newSession(t)
 
@@ -384,8 +383,33 @@ func TestListenReportsAPortAlreadyTaken(t *testing.T) {
 	if want := "cannot listen on " + cfg.Addr + ": address already in use"; err.Error() != want {
 		t.Errorf("err = %q, want %q", err, want)
 	}
-	if !errors.Is(err, syscall.EADDRINUSE) {
-		t.Errorf("err = %v, want the cause to survive wrapping so a caller can offer a hint", err)
+	if !listenErr.IsAddrInUse() {
+		t.Errorf("err = %v, want it classified as address in use", err)
+	}
+	if !errors.Is(err, listenErr.Err) {
+		t.Errorf("err = %v, want the underlying platform error to survive wrapping", err)
+	}
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) {
+		t.Errorf("err = %v, want the underlying *net.OpError to remain available", err)
+	}
+}
+
+func TestListenErrorDoesNotMisclassifyUnrelatedErrors(t *testing.T) {
+	underlying := errors.New("unrelated listener failure")
+	err := &ListenError{
+		Addr: "127.0.0.1:1025",
+		Err:  &net.OpError{Op: "listen", Err: underlying},
+	}
+
+	if err.IsAddrInUse() {
+		t.Errorf("IsAddrInUse() = true for %v", err)
+	}
+	if !errors.Is(err, underlying) {
+		t.Errorf("err = %v, want the unrelated underlying error to remain wrapped", err)
+	}
+	if want := "cannot listen on 127.0.0.1:1025: unrelated listener failure"; err.Error() != want {
+		t.Errorf("err = %q, want %q", err, want)
 	}
 }
 
