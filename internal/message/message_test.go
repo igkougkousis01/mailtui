@@ -243,3 +243,75 @@ func equalStrings(got, want []string) bool {
 	}
 	return true
 }
+
+// TestCloneSharesNothingMutable covers Clone directly, field by field, because
+// it is the whole basis of the store's ownership guarantee and a new
+// slice-backed field on Message would otherwise silently escape the copy.
+func TestCloneSharesNothingMutable(t *testing.T) {
+	original := Capture(testEnvelope, loadFixture(t, "plaintext.eml"), receivedAt)
+	if original.ParseError != nil {
+		t.Fatalf("ParseError = %v, want nil", original.ParseError)
+	}
+	if len(original.EnvelopeTo) == 0 || len(original.HeaderTo) == 0 || len(original.Raw) == 0 {
+		t.Fatal("fixture has an empty slice field; the test would prove nothing")
+	}
+
+	clone := original.Clone()
+
+	// The copy starts out saying exactly what the original says.
+	if clone.Subject != original.Subject || clone.HeaderFrom != original.HeaderFrom {
+		t.Error("Clone did not carry the scalar fields over")
+	}
+	if string(clone.Raw) != string(original.Raw) {
+		t.Error("Clone did not carry Raw over")
+	}
+	if !equalStrings(clone.EnvelopeTo, original.EnvelopeTo) || !equalStrings(clone.HeaderTo, original.HeaderTo) {
+		t.Error("Clone did not carry the address lists over")
+	}
+
+	// Writing through every mutable field of the copy leaves the original as
+	// it was, which a shallow struct copy would not.
+	for i := range clone.Raw {
+		clone.Raw[i] = 'X'
+	}
+	for i := range clone.EnvelopeTo {
+		clone.EnvelopeTo[i] = "mutated"
+	}
+	for i := range clone.HeaderTo {
+		clone.HeaderTo[i] = "mutated"
+	}
+	clone.Subject = "mutated"
+
+	if strings.Contains(string(original.Raw), "X") {
+		t.Errorf("Raw is shared: %q", original.Raw)
+	}
+	if !equalStrings(original.EnvelopeTo, testEnvelope.To) {
+		t.Errorf("EnvelopeTo is shared: %v", original.EnvelopeTo)
+	}
+	for _, to := range original.HeaderTo {
+		if to == "mutated" {
+			t.Errorf("HeaderTo is shared: %v", original.HeaderTo)
+		}
+	}
+	if original.Subject == "mutated" {
+		t.Error("Subject was changed through the clone")
+	}
+}
+
+// TestCloneKeepsNilSlicesNil pins the difference between a faithful copy and a
+// merely safe one: absent fields must stay absent.
+func TestCloneKeepsNilSlicesNil(t *testing.T) {
+	var empty Message
+
+	clone := empty.Clone()
+
+	if clone.Raw != nil {
+		t.Errorf("Raw = %v, want nil", clone.Raw)
+	}
+	if clone.EnvelopeTo != nil {
+		t.Errorf("EnvelopeTo = %v, want nil", clone.EnvelopeTo)
+	}
+	if clone.HeaderTo != nil {
+		t.Errorf("HeaderTo = %v, want nil", clone.HeaderTo)
+	}
+}

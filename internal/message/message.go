@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
@@ -30,6 +31,11 @@ type Envelope struct {
 // Message is one captured email: its SMTP envelope, the parsed headers and
 // bodies, and the exact bytes we received.
 type Message struct {
+	// ID identifies the message within the running process. It is assigned by
+	// the store when the message is added and is empty before that: a captured
+	// message that is never stored has no identity to speak of.
+	ID string
+
 	// EnvelopeFrom and EnvelopeTo come from MAIL FROM and RCPT TO. They decide
 	// where mail actually went.
 	EnvelopeFrom string
@@ -58,6 +64,28 @@ type Message struct {
 	// It lives on the Message, not in a return value, because it describes the
 	// captured artifact and has to travel with it into storage and the TUI.
 	ParseError error
+}
+
+// Clone returns a copy of m that shares nothing mutable with it.
+//
+// It exists because a Message is handed across ownership boundaries — the SMTP
+// session builds one, the store keeps one, a consumer reads one — and a plain
+// struct copy is not enough: the copy's Raw, EnvelopeTo and HeaderTo would
+// still point at the original's backing arrays, so writing through either one
+// would be visible in the other.
+//
+// A new slice-backed field on Message needs a line here. The remaining fields
+// need none: strings and time.Time are values, and ParseError holds an error
+// built by this package that is never modified after Capture returns.
+func (m Message) Clone() Message {
+	// The value receiver has already made the shallow copy; what is left is to
+	// give each slice field a backing array of its own. bytes.Clone and
+	// slices.Clone return nil for a nil input, so an absent field stays absent
+	// rather than becoming an empty non-nil slice.
+	m.Raw = bytes.Clone(m.Raw)
+	m.EnvelopeTo = slices.Clone(m.EnvelopeTo)
+	m.HeaderTo = slices.Clone(m.HeaderTo)
+	return m
 }
 
 // Capture records the raw DATA payload received for env as a Message.
