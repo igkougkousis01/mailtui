@@ -1,0 +1,7 @@
+From: shop@app.test
+To: bob@example.test
+Subject: Welcome aboard
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+
+<html><body><h1>Welcome</h1><p>Glad you are here.</p></body></html>

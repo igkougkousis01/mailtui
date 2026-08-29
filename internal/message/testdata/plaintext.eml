@@ -1,0 +1,10 @@
+From: "App Notifications" <notifications@app.test>
+To: Alice <alice@example.test>
+Subject: Your receipt
+Date: Sat, 29 Aug 2026 10:00:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Thanks for your order.
+
+Total: 12.00 EUR

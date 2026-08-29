@@ -1,0 +1,15 @@
+From: Sender <sender@app.test>
+To: Carol <carol@example.test>, dave@example.test
+Subject: Password reset
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="alt-boundary"
+
+--alt-boundary
+Content-Type: text/plain; charset=utf-8
+
+Reset your password: https://app.test/reset
+--alt-boundary
+Content-Type: text/html; charset=utf-8
+
+<p><a href="https://app.test/reset">Reset your password</a></p>
+--alt-boundary--
