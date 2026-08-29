@@ -1,0 +1,25 @@
+From: reports@app.test
+To: erin@example.test
+Subject: Monthly report
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mixed-boundary"
+
+--mixed-boundary
+Content-Type: multipart/alternative; boundary="alt-boundary"
+
+--alt-boundary
+Content-Type: text/plain; charset=utf-8
+
+Your report is attached.
+--alt-boundary
+Content-Type: text/html; charset=utf-8
+
+<p>Your report is attached.</p>
+--alt-boundary--
+--mixed-boundary
+Content-Type: text/csv; charset=utf-8; name="report.csv"
+Content-Disposition: attachment; filename="report.csv"
+
+month,total
+2026-08,42
+--mixed-boundary--
