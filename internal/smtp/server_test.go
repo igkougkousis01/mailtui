@@ -2,166 +2,239 @@ package smtp
 
 import (
 	"bytes"
-	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/igkougkousis01/mailtui/internal/message"
+	"github.com/igkougkousis01/mailtui/internal/store"
 )
 
 // rawMessage is CRLF-terminated like a real DATA payload. Its From and To
 // headers deliberately differ from the envelope used in the tests, so a value
-// in the output can be traced to the one it came from.
+// on a stored message can be traced to the one it came from.
 const rawMessage = "From: Header Sender <header-from@example.test>\r\n" +
 	"To: Header Recipient <header-to@example.test>\r\n" +
 	"Subject: hello\r\n" +
 	"\r\n" +
 	"body line one\r\nbody line two\r\n"
 
-func TestSessionReportsEnvelopeAndParsedMessage(t *testing.T) {
-	var out bytes.Buffer
-	s := &session{out: &out}
+// newSession returns a session wired to a fresh store and a log buffer, which
+// together are everything a delivery produces.
+func newSession(t *testing.T) (*session, *store.Store, *bytes.Buffer) {
+	t.Helper()
 
-	if err := s.Mail("app@example.test", nil); err != nil {
-		t.Fatalf("Mail: %v", err)
+	st := store.New()
+	var log bytes.Buffer
+	return &session{store: st, log: &log}, st, &log
+}
+
+// deliver runs one full transaction, which is what the SMTP server does per
+// message.
+func deliver(t *testing.T, s *session, from string, to []string, raw string) {
+	t.Helper()
+
+	if err := s.Mail(from, nil); err != nil {
+		t.Fatalf("Mail(%q): %v", from, err)
 	}
-	for _, to := range []string{"alice@example.test", "bob@example.test"} {
-		if err := s.Rcpt(to, nil); err != nil {
-			t.Fatalf("Rcpt(%q): %v", to, err)
+	for _, rcpt := range to {
+		if err := s.Rcpt(rcpt, nil); err != nil {
+			t.Fatalf("Rcpt(%q): %v", rcpt, err)
 		}
 	}
-
-	// Only complete messages are reported; the envelope alone prints nothing.
-	if out.Len() != 0 {
-		t.Fatalf("wrote output before DATA:\n%s", out.String())
-	}
-
-	if err := s.Data(strings.NewReader(rawMessage)); err != nil {
+	if err := s.Data(strings.NewReader(raw)); err != nil {
 		t.Fatalf("Data: %v", err)
-	}
-
-	// Each field is asserted on its own so these checks survive a change to
-	// the surrounding output format.
-	got := out.String()
-	for _, want := range []string{
-		"app@example.test",
-		"alice@example.test",
-		"bob@example.test",
-		"Header Sender <header-from@example.test>",
-		"Header Recipient <header-to@example.test>",
-		"hello",
-		"body line one",
-		"body line two",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("output missing %q\noutput:\n%s", want, got)
-		}
-	}
-
-	// A message that parses cleanly must not be flagged.
-	if strings.Contains(got, "warning") {
-		t.Errorf("output warns about a well-formed message\noutput:\n%s", got)
 	}
 }
 
-// TestSessionKeepsEnvelopeApartFromHeaders is the reason the session hands the
-// envelope to the parser instead of letting the parser infer it: the report has
-// to show both, labelled, when they disagree.
-func TestSessionKeepsEnvelopeApartFromHeaders(t *testing.T) {
-	var out bytes.Buffer
-	s := &session{out: &out}
+// only returns a snapshot of the single stored message, failing if the store
+// holds anything other than exactly one.
+func only(t *testing.T, st *store.Store) message.Message {
+	t.Helper()
 
+	list := st.List()
+	if len(list) != 1 {
+		t.Fatalf("store holds %d messages, want 1", len(list))
+	}
+	return list[0]
+}
+
+// TestDataAddsMessageToStore pins the milestone's central change: the outcome
+// of DATA is a stored message, not a line of output.
+func TestDataAddsMessageToStore(t *testing.T) {
+	s, st, _ := newSession(t)
+
+	// Nothing is stored until the message is complete; the envelope alone is
+	// not a delivery.
 	if err := s.Mail("app@example.test", nil); err != nil {
 		t.Fatalf("Mail: %v", err)
 	}
 	if err := s.Rcpt("alice@example.test", nil); err != nil {
 		t.Fatalf("Rcpt: %v", err)
 	}
+	if got := len(st.List()); got != 0 {
+		t.Fatalf("store holds %d messages before DATA, want 0", got)
+	}
+
 	if err := s.Data(strings.NewReader(rawMessage)); err != nil {
 		t.Fatalf("Data: %v", err)
 	}
 
-	got := out.String()
-	for _, want := range []string{
-		"envelope from: app@example.test",
-		"envelope to:   alice@example.test",
-		"header from:   Header Sender <header-from@example.test>",
-		"header to:     Header Recipient <header-to@example.test>",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("output missing %q\noutput:\n%s", want, got)
+	msg := only(t, st)
+	if msg.ID == "" {
+		t.Error("stored message has no ID")
+	}
+	if msg.ParseError != nil {
+		t.Errorf("ParseError = %v on a well-formed message, want nil", msg.ParseError)
+	}
+	if msg.ReceivedAt.IsZero() {
+		t.Error("ReceivedAt is zero")
+	}
+	got, ok := st.Get(msg.ID)
+	if !ok {
+		t.Fatalf("Get(%q): the listed message is not indexed", msg.ID)
+	}
+	if got.Subject != msg.Subject || string(got.Raw) != string(msg.Raw) {
+		t.Errorf("Get(%q) does not agree with List() about the stored message", msg.ID)
+	}
+}
+
+// TestDataStoresEnvelopeApartFromHeaders is the reason the session hands the
+// envelope to the parser instead of letting the parser infer it: both survive
+// into the store, separately, so a consumer can show the difference.
+func TestDataStoresEnvelopeApartFromHeaders(t *testing.T) {
+	s, st, _ := newSession(t)
+
+	deliver(t, s, "app@example.test",
+		[]string{"alice@example.test", "bob@example.test"}, rawMessage)
+
+	msg := only(t, st)
+
+	if want := "app@example.test"; msg.EnvelopeFrom != want {
+		t.Errorf("EnvelopeFrom = %q, want %q", msg.EnvelopeFrom, want)
+	}
+	if want := "alice@example.test, bob@example.test"; strings.Join(msg.EnvelopeTo, ", ") != want {
+		t.Errorf("EnvelopeTo = %q, want %q", msg.EnvelopeTo, want)
+	}
+	if want := "Header Sender <header-from@example.test>"; msg.HeaderFrom != want {
+		t.Errorf("HeaderFrom = %q, want %q", msg.HeaderFrom, want)
+	}
+	if want := "Header Recipient <header-to@example.test>"; strings.Join(msg.HeaderTo, ", ") != want {
+		t.Errorf("HeaderTo = %q, want %q", msg.HeaderTo, want)
+	}
+	if want := "hello"; msg.Subject != want {
+		t.Errorf("Subject = %q, want %q", msg.Subject, want)
+	}
+	if !strings.Contains(msg.TextBody, "body line one") {
+		t.Errorf("TextBody = %q, want it to contain the body", msg.TextBody)
+	}
+}
+
+// TestDataStoresRawBytesExactly guards the promise the catcher is built on: the
+// payload reaches the store byte for byte, CRLFs included.
+func TestDataStoresRawBytesExactly(t *testing.T) {
+	s, st, _ := newSession(t)
+
+	deliver(t, s, "app@example.test", []string{"alice@example.test"}, rawMessage)
+
+	if got := string(only(t, st).Raw); got != rawMessage {
+		t.Errorf("Raw = %q, want %q", got, rawMessage)
+	}
+}
+
+// TestDataStoresUnparsableMessage pins the catcher's whole point: a message we
+// cannot parse is still stored, with the reason attached, because it is often
+// the artifact the developer is trying to inspect. Only a broken SMTP
+// transaction fails.
+func TestDataStoresUnparsableMessage(t *testing.T) {
+	const malformed = "this is not a mail message\r\nnor is this\r\n"
+
+	s, st, log := newSession(t)
+
+	deliver(t, s, "app@example.test",
+		[]string{"alice@example.test", "bob@example.test"}, malformed)
+
+	msg := only(t, st)
+
+	// The failure is recorded rather than swallowed, and it says what broke.
+	if msg.ParseError == nil {
+		t.Fatal("ParseError = nil on a malformed message")
+	}
+	if !strings.Contains(msg.ParseError.Error(), "malformed MIME header line") {
+		t.Errorf("ParseError = %v, want it to say what could not be parsed", msg.ParseError)
+	}
+
+	// Everything the SMTP layer is responsible for survives the parse failure.
+	if want := "app@example.test"; msg.EnvelopeFrom != want {
+		t.Errorf("EnvelopeFrom = %q, want %q", msg.EnvelopeFrom, want)
+	}
+	if want := "alice@example.test, bob@example.test"; strings.Join(msg.EnvelopeTo, ", ") != want {
+		t.Errorf("EnvelopeTo = %q, want %q", msg.EnvelopeTo, want)
+	}
+	if got := string(msg.Raw); got != malformed {
+		t.Errorf("Raw = %q, want %q", got, malformed)
+	}
+	if msg.ID == "" {
+		t.Error("a malformed message was stored without an ID")
+	}
+
+	// The warning reaches whoever is watching the terminal, on one line: the
+	// parser quotes the offending line verbatim, CRLF included, and an
+	// untrimmed warning would split across lines.
+	got := log.String()
+	if !strings.Contains(got, "parse warning") {
+		t.Errorf("log does not mention the parse failure:\n%s", got)
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if strings.Contains(line, "parse warning") && strings.ContainsAny(line, "\r") {
+			t.Errorf("warning line contains a carriage return: %q", line)
 		}
 	}
 }
 
-// TestSessionAcceptsUnparsableData pins the catcher's whole point: a message we
-// cannot parse is still accepted and reported, because it is often the artifact
-// the developer is trying to inspect. Only a broken SMTP transaction fails.
-func TestSessionAcceptsUnparsableData(t *testing.T) {
-	const malformed = "this is not a mail message\r\nnor is this\r\n"
+// TestDataNotifiesSubscribers is the end of the flow this milestone builds:
+// DATA reaches a consumer without anyone polling for it. The consumer is
+// handed an ID and fetches the message itself.
+func TestDataNotifiesSubscribers(t *testing.T) {
+	s, st, _ := newSession(t)
 
-	var out bytes.Buffer
-	s := &session{out: &out}
+	ch, cancel := s.store.Subscribe()
+	defer cancel()
 
-	if err := s.Mail("app@example.test", nil); err != nil {
-		t.Fatalf("Mail: %v", err)
-	}
-	for _, to := range []string{"alice@example.test", "bob@example.test"} {
-		if err := s.Rcpt(to, nil); err != nil {
-			t.Fatalf("Rcpt(%q): %v", to, err)
+	deliver(t, s, "app@example.test", []string{"alice@example.test"}, rawMessage)
+
+	select {
+	case id := <-ch:
+		if want := only(t, st).ID; id != want {
+			t.Errorf("notified ID = %q, want %q", id, want)
 		}
-	}
-
-	if err := s.Data(strings.NewReader(malformed)); err != nil {
-		t.Fatalf("Data rejected a malformed message: %v", err)
-	}
-
-	got := out.String()
-
-	// The failure is reported rather than swallowed, and it says what broke.
-	if !strings.Contains(got, "warning: captured but not fully parsed") {
-		t.Errorf("output does not report the parse failure\noutput:\n%s", got)
-	}
-	if !strings.Contains(got, "malformed MIME header line") {
-		t.Errorf("output does not say what could not be parsed\noutput:\n%s", got)
-	}
-	// The parser quotes the offending line with its CRLF still attached, which
-	// would split the warning across lines and leave a stray blank one. The
-	// warning must occupy exactly one line, with the report resuming below it.
-	lines := strings.Split(got, "\n")
-	warned := -1
-	for i, line := range lines {
-		if strings.HasPrefix(line, "warning:") {
-			warned = i
-			break
+		msg, ok := st.Get(id)
+		if !ok {
+			t.Fatalf("Get(%q): a notified message is not in the store", id)
 		}
-	}
-	if warned == -1 {
-		t.Fatalf("no warning line in output:\n%s", got)
-	}
-	if strings.ContainsAny(lines[warned], "\r") {
-		t.Errorf("warning line contains a carriage return: %q", lines[warned])
-	}
-	if next := lines[warned+1]; !strings.HasPrefix(next, "envelope from:") {
-		t.Errorf("line after the warning = %q, want the report to resume at %q", next, "envelope from:")
-	}
-
-	// The envelope is still reported, and the payload is still accounted for.
-	for _, want := range []string{
-		"envelope from: app@example.test",
-		"envelope to:   alice@example.test, bob@example.test",
-		fmt.Sprintf("(%d raw bytes)", len(malformed)),
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("output missing %q\noutput:\n%s", want, got)
+		if string(msg.Raw) != rawMessage {
+			t.Errorf("the notified message has the wrong payload: %q", msg.Raw)
 		}
+	default:
+		t.Fatal("storing a message did not notify the subscriber")
 	}
+}
+
+// TestSessionLogIsOptional covers the nil writer, which is what the TUI will
+// pass once it owns the terminal.
+func TestSessionLogIsOptional(t *testing.T) {
+	st := store.New()
+	s := &session{store: st}
+
+	deliver(t, s, "app@example.test", []string{"alice@example.test"}, rawMessage)
+
+	only(t, st)
 }
 
 // TestSessionResetDiscardsEnvelope covers the case Reset exists for: a client
 // that abandons a message with RSET and sends another on the same connection
 // must not inherit the abandoned sender or recipients.
 func TestSessionResetDiscardsEnvelope(t *testing.T) {
-	var out bytes.Buffer
-	s := &session{out: &out}
+	s, st, _ := newSession(t)
 
 	if err := s.Mail("stale@example.test", nil); err != nil {
 		t.Fatalf("Mail: %v", err)
@@ -179,25 +252,34 @@ func TestSessionResetDiscardsEnvelope(t *testing.T) {
 		t.Errorf("to = %v after Reset, want empty", s.to)
 	}
 
-	if err := s.Mail("second@example.test", nil); err != nil {
-		t.Fatalf("Mail after Reset: %v", err)
+	deliver(t, s, "second@example.test", []string{"kept@example.test"}, rawMessage)
+
+	// An abandoned envelope must not reach the store, and nothing was stored
+	// for the abandoned transaction either.
+	msg := only(t, st)
+	if msg.EnvelopeFrom != "second@example.test" {
+		t.Errorf("EnvelopeFrom = %q, want %q", msg.EnvelopeFrom, "second@example.test")
 	}
-	if err := s.Rcpt("kept@example.test", nil); err != nil {
-		t.Fatalf("Rcpt after Reset: %v", err)
+	if strings.Join(msg.EnvelopeTo, ", ") != "kept@example.test" {
+		t.Errorf("EnvelopeTo = %q, want [kept@example.test]", msg.EnvelopeTo)
 	}
-	if err := s.Data(strings.NewReader(rawMessage)); err != nil {
-		t.Fatalf("Data after Reset: %v", err)
+}
+
+// TestBackendGivesEachSessionTheSameStore pins the injection: sessions are
+// per-connection, but they all deliver into the one store the caller owns.
+func TestBackendGivesEachSessionTheSameStore(t *testing.T) {
+	st := store.New()
+	b := &backend{store: st}
+
+	for i := 0; i < 2; i++ {
+		sess, err := b.NewSession(nil)
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		deliver(t, sess.(*session), "app@example.test", []string{"alice@example.test"}, rawMessage)
 	}
 
-	got := out.String()
-	for _, want := range []string{"second@example.test", "kept@example.test"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("output missing %q\noutput:\n%s", want, got)
-		}
-	}
-	for _, unwanted := range []string{"stale@example.test", "discarded@example.test"} {
-		if strings.Contains(got, unwanted) {
-			t.Errorf("output leaked discarded envelope %q\noutput:\n%s", unwanted, got)
-		}
+	if got := len(st.List()); got != 2 {
+		t.Errorf("store holds %d messages after two sessions, want 2", got)
 	}
 }

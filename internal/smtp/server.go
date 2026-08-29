@@ -3,7 +3,9 @@
 //
 // It owns the SMTP conversation and the envelope it carries. Everything about
 // the content of a message belongs to the message package: this package reads
-// the DATA payload and hands the raw bytes over unchanged.
+// the DATA payload and hands the raw bytes there. The captured message then
+// goes into the store, which is the real outcome of a delivery; anything
+// written to the log is a convenience for whoever is watching the terminal.
 package smtp
 
 import (
@@ -16,6 +18,7 @@ import (
 	gosmtp "github.com/emersion/go-smtp"
 
 	"github.com/igkougkousis01/mailtui/internal/message"
+	"github.com/igkougkousis01/mailtui/internal/store"
 )
 
 const (
@@ -29,9 +32,11 @@ const (
 )
 
 // ListenAndServe starts the SMTP catcher on addr and blocks until it stops.
-// A summary of each received message is written to out.
-func ListenAndServe(addr string, out io.Writer) error {
-	s := gosmtp.NewServer(&backend{out: out})
+// Captured messages are added to st, which the caller owns and shares with the
+// rest of the program. A one-line note about each message is written to log,
+// which may be nil to keep quiet.
+func ListenAndServe(addr string, st *store.Store, log io.Writer) error {
+	s := gosmtp.NewServer(&backend{store: st, log: log})
 
 	s.Addr = addr
 	s.Domain = "localhost"
@@ -47,26 +52,29 @@ func ListenAndServe(addr string, out io.Writer) error {
 		return fmt.Errorf("listen on %s: %w", addr, err)
 	}
 
-	fmt.Fprintf(out, "mailtui: SMTP catcher listening on %s\n", l.Addr())
+	logf(log, "mailtui: SMTP catcher listening on %s\n", l.Addr())
 
 	return s.Serve(l)
 }
 
-// backend hands out a fresh session per connection.
+// backend hands out a fresh session per connection. The store is shared across
+// all of them, which is why it has to be safe for concurrent use.
 type backend struct {
-	out io.Writer
+	store *store.Store
+	log   io.Writer
 }
 
 func (b *backend) NewSession(_ *gosmtp.Conn) (gosmtp.Session, error) {
-	return &session{out: b.out}, nil
+	return &session{store: b.store, log: b.log}, nil
 }
 
 // session holds the envelope of the message currently being received: the
 // sender from MAIL FROM and the recipients from RCPT TO.
 type session struct {
-	out  io.Writer
-	from string
-	to   []string
+	store *store.Store
+	log   io.Writer
+	from  string
+	to    []string
 }
 
 func (s *session) Mail(from string, _ *gosmtp.MailOptions) error {
@@ -79,10 +87,10 @@ func (s *session) Rcpt(to string, _ *gosmtp.RcptOptions) error {
 	return nil
 }
 
-// Data captures the message. It fails only when the SMTP transaction itself
-// does, such as a connection that drops mid-payload: content we cannot parse is
-// still accepted, because a malformed message is often exactly the artifact the
-// developer is trying to look at.
+// Data captures the message and stores it. It fails only when the SMTP
+// transaction itself does, such as a connection that drops mid-payload:
+// content we cannot parse is still stored, because a malformed message is
+// often exactly the artifact the developer is trying to look at.
 func (s *session) Data(r io.Reader) error {
 	raw, err := io.ReadAll(r)
 	if err != nil {
@@ -90,48 +98,42 @@ func (s *session) Data(r io.Reader) error {
 	}
 
 	env := message.Envelope{From: s.from, To: s.to}
+	msg := message.Capture(env, raw, time.Now())
 
-	return s.report(message.Capture(env, raw, time.Now()))
+	// Add copies what it is given, so the captured Message is this session's to
+	// drop; the store's copy, under the ID returned here, is the real outcome.
+	id := s.store.Add(msg)
+	s.note(id, msg)
+
+	return nil
 }
 
-// report writes a summary of the captured message to the configured output.
-// This is the debugging view for the current milestone and will be replaced by
-// the TUI; the structured Message, not this text, is the real result of Data.
-func (s *session) report(msg *message.Message) error {
-	// Built in one buffer and written once, so summaries from concurrent
-	// connections do not interleave line by line.
-	var b strings.Builder
+// note writes the one line that says a message arrived. It is a breadcrumb for
+// someone watching the terminal, not a view of the message: the stored Message
+// is the result of Data, and the TUI reads it from the store.
+func (s *session) note(id string, msg *message.Message) {
+	// The envelope, not the headers, because that is what the SMTP transaction
+	// actually carried and what this package is responsible for.
+	line := fmt.Sprintf("mailtui: stored message %s from %s to %s (%d bytes)",
+		id, msg.EnvelopeFrom, strings.Join(msg.EnvelopeTo, ", "), len(msg.Raw))
 
-	fmt.Fprintf(&b, "\n--- message received %s ---\n", msg.ReceivedAt.Format(time.RFC3339))
 	if msg.ParseError != nil {
-		// Printed above the fields it qualifies, so the reader knows they are
-		// empty or incomplete before reading them. The message was still kept:
-		// its raw bytes are intact on the Message.
-		//
-		// Trimmed because the parser quotes the offending line verbatim, CRLF
-		// included, and a warning has to stay on one line to be readable.
-		fmt.Fprintf(&b, "warning: captured but not fully parsed: %s\n",
-			strings.TrimSpace(msg.ParseError.Error()))
-	}
-	// The envelope and the headers are printed separately because they can
-	// disagree, and the difference is often the thing being debugged.
-	fmt.Fprintf(&b, "envelope from: %s\n", msg.EnvelopeFrom)
-	fmt.Fprintf(&b, "envelope to:   %s\n", strings.Join(msg.EnvelopeTo, ", "))
-	fmt.Fprintf(&b, "header from:   %s\n", msg.HeaderFrom)
-	fmt.Fprintf(&b, "header to:     %s\n", strings.Join(msg.HeaderTo, ", "))
-	fmt.Fprintf(&b, "subject:       %s\n", msg.Subject)
-
-	if msg.TextBody != "" {
-		fmt.Fprintf(&b, "\n%s\n", strings.TrimRight(msg.TextBody, "\r\n"))
-	}
-	if msg.HTMLBody != "" {
-		fmt.Fprintf(&b, "\n[html body, %d bytes]\n", len(msg.HTMLBody))
+		// Trimmed and kept on the same line because the parser quotes the
+		// offending line verbatim, CRLF included.
+		line += fmt.Sprintf(" [parse warning: %s]", strings.TrimSpace(msg.ParseError.Error()))
 	}
 
-	fmt.Fprintf(&b, "--- end of message (%d raw bytes) ---\n", len(msg.Raw))
+	logf(s.log, "%s\n", line)
+}
 
-	_, err := io.WriteString(s.out, b.String())
-	return err
+// logf writes to an optional log. A nil writer means the caller does not want
+// the running commentary, which is the normal case once the TUI owns the
+// terminal.
+func logf(w io.Writer, format string, args ...any) {
+	if w == nil {
+		return
+	}
+	fmt.Fprintf(w, format, args...)
 }
 
 // Reset discards the message currently being built, per RSET.

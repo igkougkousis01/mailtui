@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/igkougkousis01/mailtui/internal/smtp"
+	"github.com/igkougkousis01/mailtui/internal/store"
 )
 
 // addr is loopback-only on purpose: the catcher accepts mail without
@@ -13,7 +14,11 @@ import (
 const addr = "127.0.0.1:1025"
 
 func main() {
-	if err := smtp.ListenAndServe(addr, os.Stdout); err != nil {
+	// The store is created here and injected, so that the TUI and CLI commands
+	// added later share this one rather than reaching for a global.
+	messages := store.New()
+
+	if err := smtp.ListenAndServe(addr, messages, os.Stdout); err != nil {
 		log.Fatalf("mailtui: %v", err)
 	}
 }
