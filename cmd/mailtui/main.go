@@ -1,37 +1,49 @@
-// Command mailtui runs a local SMTP catcher for development and shows what it
-// catches in a terminal inbox.
+// Command mailtui runs a local SMTP catcher for development.
+//
+// Run with no arguments it shows what it catches in a terminal inbox. Run with
+// a command — wait, assert, extract — it answers a question about the mail an
+// application under test sends, and exits with a code a script can act on. See
+// package cli for the process model that separates the two.
 package main
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
+	"os/signal"
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/igkougkousis01/mailtui/internal/cli"
 	"github.com/igkougkousis01/mailtui/internal/smtp"
 	"github.com/igkougkousis01/mailtui/internal/store"
 	"github.com/igkougkousis01/mailtui/internal/tui"
 )
 
-// addr is loopback-only on purpose: the catcher accepts mail without
-// authentication and must not be reachable from the network.
-const addr = "127.0.0.1:1025"
-
 func main() {
-	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "mailtui: %v\n", err)
-		os.Exit(1)
+	// Ctrl-C has to reach a waiting command, which is otherwise blocked on
+	// mail that may never come. The interactive inbox handles its own
+	// interrupt through Bubble Tea and is unaffected by this: the context it
+	// is given being cancelled just ends the program, which is what the key
+	// press meant anyway.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	app := &cli.App{
+		Stdout:      os.Stdout,
+		Stderr:      os.Stderr,
+		Interactive: runInteractive,
 	}
+
+	os.Exit(app.Run(ctx, os.Args[1:]))
 }
 
-// run wires the two halves of the program together: the SMTP server fills the
-// store, the TUI reads it.
+// runInteractive wires the two halves of the interactive program together: the
+// SMTP server fills the store, the TUI reads it.
 //
 // Lifecycle, in the smallest shape that is correct. The TUI runs on the main
 // goroutine and owns the terminal; the server runs beside it for as long as
-// the process does. Quitting the TUI returns from run and from main, which
+// the process does. Quitting the TUI returns from here and from main, which
 // ends the process and the listener with it — there is no state to flush and
 // nothing to persist, so a graceful SMTP shutdown would buy nothing.
 //
@@ -39,10 +51,10 @@ func main() {
 // dies, leaves a TUI that will never show anything. Cancelling the context
 // stops the program, restores the terminal, and lets the real error be
 // reported on a clean screen.
-func run() error {
+func runInteractive(ctx context.Context) error {
 	messages := store.New()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// Buffered so the server goroutine can report and exit even if the user
@@ -52,11 +64,11 @@ func run() error {
 		// A nil log writer: Bubble Tea owns the terminal, and the per-message
 		// notes the server would otherwise print would be written straight
 		// over the rendered screen. The TUI is the log now.
-		serverErr <- smtp.ListenAndServe(addr, messages, nil)
+		serverErr <- smtp.ListenAndServe(cli.DefaultSMTPAddr, messages, nil)
 		cancel()
 	}()
 
-	runErr := tui.Run(ctx, messages, addr)
+	runErr := tui.Run(ctx, messages, cli.DefaultSMTPAddr)
 
 	// The server failing is the more useful thing to report: it is why the TUI
 	// stopped, rather than something that went wrong in the TUI itself.

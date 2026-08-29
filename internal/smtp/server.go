@@ -9,10 +9,13 @@
 package smtp
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	stdlog "log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	gosmtp "github.com/emersion/go-smtp"
@@ -36,7 +39,35 @@ const (
 // rest of the program. A one-line note about each message is written to log,
 // which may be nil to keep quiet.
 func ListenAndServe(addr string, st *store.Store, log io.Writer) error {
-	s := gosmtp.NewServer(&backend{store: st, log: log})
+	s, err := Listen(addr, st, log)
+	if err != nil {
+		return err
+	}
+	return s.Serve()
+}
+
+// Server is a catcher that has claimed its port but is not yet accepting.
+//
+// It exists for callers that need the port before the mail starts flowing: a
+// script-mode command has to report the address it is listening on, has to be
+// told at once when the port is already taken, and — when it is given port 0 —
+// only learns the real port from the listener. Binding and serving are
+// separate calls so that all three are answerable before Serve blocks.
+type Server struct {
+	srv     *gosmtp.Server
+	backend *backend
+	l       net.Listener
+	log     io.Writer
+}
+
+// Listen claims addr for a catcher that adds what it receives to st.
+//
+// The port is held from here on, so a caller that gets a Server back and then
+// changes its mind must Close it. Notes about each message go to log, which
+// may be nil to keep quiet; see ListenAndServe.
+func Listen(addr string, st *store.Store, log io.Writer) (*Server, error) {
+	b := &backend{store: st, log: log}
+	s := gosmtp.NewServer(b)
 
 	s.Addr = addr
 	s.Domain = "localhost"
@@ -45,16 +76,60 @@ func ListenAndServe(addr string, st *store.Store, log io.Writer) error {
 	s.ReadTimeout = readTimeout
 	s.WriteTimeout = writeTimeout
 
+	// go-smtp logs accept and session errors to stderr by default, which is
+	// exactly where they must not go: stderr is the TUI's screen in one mode
+	// and a script's diagnostics in the other, and neither wants a library
+	// writing to it unbidden. A caller that asked for notes gets these too.
+	if log == nil {
+		s.ErrorLog = stdlog.New(io.Discard, "", 0)
+	} else {
+		s.ErrorLog = stdlog.New(log, "smtp: ", 0)
+	}
+
 	// Bind first so we only claim to be listening once the port is actually
 	// ours, and so the caller sees the real address when addr uses port 0.
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("listen on %s: %w", addr, err)
+		return nil, fmt.Errorf("listen on %s: %w", addr, err)
 	}
 
-	logf(log, "mailtui: SMTP catcher listening on %s\n", l.Addr())
+	return &Server{srv: s, backend: b, l: l, log: log}, nil
+}
 
-	return s.Serve(l)
+// Addr is the address the catcher is bound to, with the port resolved.
+func (s *Server) Addr() net.Addr { return s.l.Addr() }
+
+// Serve accepts mail until Close is called, and returns nil when it is.
+func (s *Server) Serve() error {
+	logf(s.log, "mailtui: SMTP catcher listening on %s\n", s.l.Addr())
+
+	return s.srv.Serve(s.l)
+}
+
+// Stop shuts the catcher down, giving deliveries already under way up to grace
+// to finish first.
+//
+// The grace is not politeness, it is correctness. A message reaches the store
+// while its SMTP session is still open: the server writes its 250 only after
+// the handler that stored it returns, and a command watching the store can be
+// woken and be finished in between. Closing the listener at that moment drops
+// the connection before the acknowledgement, and the application under test —
+// which sent the mail perfectly well — reports a failed send. So a stop waits
+// for the sessions in flight, and only then cuts off whatever is left, which
+// bounds the wait for a client that holds its connection open.
+func (s *Server) Stop(grace time.Duration) error {
+	s.backend.waitIdle(grace)
+	return s.Close()
+}
+
+// Close stops the catcher: the port is released and any session still open is
+// cut off, which is what ends the goroutines behind them. Serve then returns
+// nil. Calling it twice is harmless.
+func (s *Server) Close() error {
+	if err := s.srv.Close(); err != nil && !errors.Is(err, gosmtp.ErrServerClosed) {
+		return err
+	}
+	return nil
 }
 
 // backend hands out a fresh session per connection. The store is shared across
@@ -62,19 +137,49 @@ func ListenAndServe(addr string, st *store.Store, log io.Writer) error {
 type backend struct {
 	store *store.Store
 	log   io.Writer
+
+	// live counts the sessions that have not logged out yet, so that a
+	// stopping server can tell whether anyone is mid-delivery. See Stop.
+	live sync.WaitGroup
 }
 
 func (b *backend) NewSession(_ *gosmtp.Conn) (gosmtp.Session, error) {
-	return &session{store: b.store, log: b.log}, nil
+	b.live.Add(1)
+	return &session{store: b.store, log: b.log, backend: b}, nil
+}
+
+// waitIdle blocks until no session is in flight, or until timeout, whichever
+// comes first.
+func (b *backend) waitIdle(timeout time.Duration) {
+	idle := make(chan struct{})
+	go func() {
+		defer close(idle)
+		b.live.Wait()
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-idle:
+	case <-timer.C:
+		// The remaining sessions are about to be cut off by Close, which ends
+		// them and so ends the goroutine above with them.
+	}
 }
 
 // session holds the envelope of the message currently being received: the
 // sender from MAIL FROM and the recipients from RCPT TO.
 type session struct {
-	store *store.Store
-	log   io.Writer
-	from  string
-	to    []string
+	store   *store.Store
+	log     io.Writer
+	backend *backend
+	from    string
+	to      []string
+
+	// loggedOut makes the count in backend.live safe against a Logout that
+	// arrives twice, which a counter has no way to survive otherwise.
+	loggedOut sync.Once
 }
 
 func (s *session) Mail(from string, _ *gosmtp.MailOptions) error {
@@ -142,4 +247,11 @@ func (s *session) Reset() {
 	s.to = nil
 }
 
-func (s *session) Logout() error { return nil }
+// Logout ends the session, which is what releases it from the count of
+// deliveries in flight.
+func (s *session) Logout() error {
+	if s.backend != nil {
+		s.loggedOut.Do(s.backend.live.Done)
+	}
+	return nil
+}
