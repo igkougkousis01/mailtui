@@ -131,7 +131,8 @@ func (a *App) catch(ctx context.Context, o options) (message.Message, int) {
 	}
 
 	if ctx.Err() != nil {
-		// SIGINT or SIGTERM; see the package comment on signal ownership.
+		// Parent cancellation or a supported console signal; see the package
+		// comment on signal ownership.
 		a.errf("interrupted while waiting for %s", describe(o.selection))
 		return message.Message{}, ExitInterrupted
 	}

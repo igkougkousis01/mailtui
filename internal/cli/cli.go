@@ -35,8 +35,10 @@
 //
 // # Signal ownership
 //
-// SIGINT and SIGTERM are handled in exactly one place per mode, and the two
-// places never overlap.
+// Console interruption is handled in exactly one place per mode, and the two
+// places never overlap. On macOS and Linux that includes SIGINT and SIGTERM;
+// on Windows it covers the ordinary console interrupt represented by
+// os.Interrupt.
 //
 // A script-mode command is interrupted through the context Run installs around
 // it, and nothing below it registers a handler of its own: the command is
@@ -80,9 +82,10 @@ const (
 	// use. Distinct from ExitFailure because a broken invocation and a failed
 	// assertion call for different reactions.
 	ExitUsage = 2
-	// ExitInterrupted means the run was stopped by a signal — Ctrl-C, or a
-	// SIGTERM from whatever supervises the script. 128+SIGINT, as a shell
-	// reports it, so a script can tell "I stopped this" from "this failed".
+	// ExitInterrupted means the run was stopped by cancellation or a supported
+	// console signal — Ctrl-C, or SIGTERM on Unix-like systems. Its value is
+	// 128+SIGINT, as Unix shells report it, so a script can tell "I stopped
+	// this" from "this failed" consistently.
 	ExitInterrupted = 130
 )
 
@@ -210,7 +213,7 @@ func (a *App) listenHint(err error) {
 		return
 	}
 	switch {
-	case errors.Is(err, syscall.EADDRINUSE):
+	case listenErr.IsAddrInUse():
 		a.hintf("another mailtui may already be listening there; stop it, or pass --smtp-addr with a free loopback port")
 	case errors.Is(err, syscall.EACCES):
 		a.hintf("ports below 1024 need privileges; pass --smtp-addr with a higher port")

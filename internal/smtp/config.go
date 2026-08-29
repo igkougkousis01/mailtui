@@ -73,18 +73,30 @@ func DefaultConfig() Config {
 // It exists to put one readable sentence in front of the user instead of the
 // three nested ones the network stack produces: "listen on 127.0.0.1:1025:
 // listen tcp 127.0.0.1:1025: bind: address already in use" says the address
-// three times and the interesting part once. The cause is still wrapped, so a
-// caller can ask errors.Is whether the port was taken and offer a hint.
+// three times and the interesting part once. The cause is still wrapped. A
+// caller uses IsAddrInUse rather than depending on an operating system's errno
+// value or localized error text.
 type ListenError struct {
 	Addr string
 	Err  error
 }
 
 func (e *ListenError) Error() string {
+	if e.IsAddrInUse() {
+		return fmt.Sprintf("cannot listen on %s: address already in use", e.Addr)
+	}
 	return fmt.Sprintf("cannot listen on %s: %s", e.Addr, cause(e.Err))
 }
 
 func (e *ListenError) Unwrap() error { return e.Err }
+
+// IsAddrInUse reports whether the listener failed because another socket
+// already holds the address. It classifies the wrapped operating-system error
+// semantically, so callers do not need to know whether the platform reported
+// POSIX EADDRINUSE or the Windows Winsock equivalent.
+func (e *ListenError) IsAddrInUse() bool {
+	return e != nil && isAddrInUse(e.Err)
+}
 
 // cause digs the operating system's own words out of a dial or listen error.
 // net wraps a syscall error in an os.SyscallError in a net.OpError, and each

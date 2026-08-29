@@ -21,9 +21,10 @@
 //
 // # Signals
 //
-// None are handled here. Bubble Tea installs a handler for SIGINT and SIGTERM
-// and is the only thing that can restore the terminal, so it keeps them; see
-// the cli package comment on signal ownership.
+// None are handled here. Bubble Tea owns the platform's console interruption
+// handling and is the only thing that can restore the terminal, so it keeps
+// it. On macOS and Linux that includes SIGINT and SIGTERM; on Windows it covers
+// normal console interruption. See the cli package comment on signal ownership.
 package interactive
 
 import (

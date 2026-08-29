@@ -51,7 +51,7 @@ go test -race ./...
 go build ./...
 ```
 
-The race test runs on Linux and macOS in CI. Windows runs formatting, vet, unit tests, and builds.
+Formatting and vet run once on Ubuntu in CI. The platform matrix runs unit tests and builds on Linux, macOS, and Windows; race tests run on Linux and macOS.
 
 After changing module requirements, normalize them with:
 

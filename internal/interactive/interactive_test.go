@@ -7,7 +7,6 @@ import (
 	netsmtp "net/smtp"
 	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -77,8 +76,11 @@ func TestBindFailureIsReportedBeforeAnythingIsDrawn(t *testing.T) {
 	if !errors.As(err, &listenErr) {
 		t.Fatalf("err = %v, want a *smtp.ListenError", err)
 	}
-	if !errors.Is(err, syscall.EADDRINUSE) {
-		t.Errorf("err = %v, want the address-in-use cause to survive wrapping", err)
+	if !listenErr.IsAddrInUse() {
+		t.Errorf("err = %v, want it classified as address in use", err)
+	}
+	if want := "cannot listen on " + cfg.Addr + ": address already in use"; err.Error() != want {
+		t.Errorf("err = %q, want %q", err, want)
 	}
 	if strings.Contains(err.Error(), "listen tcp") {
 		t.Errorf("err = %q, want the network stack's wrapping trimmed off", err)
